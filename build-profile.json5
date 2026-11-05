@@ -1,0 +1,49 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\zhang\\.ohos\\config\\default_SpektraLabHarmony_-JKuuim8t_Kw5VtJItQtLy_3XiQj10_x9yyn_zUEsBY=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B91F55C4D46BA4E8709A63685CBB14E6DE5AD6A3E0977C5DBFB3B88A1E96F8591524264E45132FE",
+          "profile": "C:\\Users\\zhang\\.ohos\\config\\default_SpektraLabHarmony_-JKuuim8t_Kw5VtJItQtLy_3XiQj10_x9yyn_zUEsBY=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\zhang\\.ohos\\config\\default_SpektraLabHarmony_-JKuuim8t_Kw5VtJItQtLy_3XiQj10_x9yyn_zUEsBY=.p12",
+          "storePassword": "0000001BFEE1E789BFC36433CDAA810B36E10331062111EBCA079C58A14988DA74CD2B02E6F09A7CAC4868"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "5.0.0(12)",
+        "runtimeOS": "HarmonyOS",
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+# 构建产物
+build/
+entry/build/
+.hvigor/
+.preview/
+.cxx/
+*.har
+*.hap
+*.hsp
+*.app
+
+# 依赖
+oh_modules/
+node_modules/
+
+# IDE / 本地配置
+.idea/
+local.properties
+.clangd
+.clang-format
+*.iml
+
+# 日志与临时文件
+*.log
+.DS_Store
+Thumbs.db

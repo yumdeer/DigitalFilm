@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "SpektraLab spectral film simulation"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "SpektraLab spectral film simulation"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "SpektraLab"
+    }
+  ]
+}

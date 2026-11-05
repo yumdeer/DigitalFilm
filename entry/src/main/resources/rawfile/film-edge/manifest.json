@@ -1,0 +1,50 @@
+{
+ "schema": 1,
+ "source": "Filmroom 0.1.20 fixed135 (generated film artwork)",
+ "canvas_px": [
+  1520,
+  1400
+ ],
+ "pixels_per_mm": 40,
+ "canvas_mm": [
+  38,
+  35
+ ],
+ "aperture_px": [
+  40,
+  220,
+  1480,
+  1180
+ ],
+ "aperture_mm": [
+  36,
+  24
+ ],
+ "portrait_rotation": "clockwise90",
+ "styles": {
+  "kodak_portra_400": "kodak_portra_400.webp",
+  "kodak_portra_160": "kodak_portra_160.webp",
+  "kodak_portra_800": "kodak_portra_800.webp",
+  "kodak_portra_800_push1": "kodak_portra_800.webp",
+  "kodak_portra_800_push2": "kodak_portra_800.webp",
+  "kodak_ektar_100": "kodak_ektar_100.webp",
+  "kodak_gold_200": "kodak_gold_200.webp",
+  "kodak_ultramax_400": "kodak_ultramax_400.webp",
+  "fujifilm_pro_400h": "fujifilm_pro_400h.webp",
+  "fujifilm_c200": "fujifilm_c200.webp",
+  "fujifilm_xtra_400": "fujifilm_xtra_400.webp",
+  "kodak_vision3_50d": "kodak_vision3_50d.webp",
+  "kodak_vision3_250d": "kodak_vision3_250d.webp",
+  "kodak_vision3_200t": "kodak_vision3_200t.webp",
+  "kodak_vision3_500t": "kodak_vision3_500t.webp",
+  "kodak_verita_200d": "kodak_verita_200d.webp",
+  "cinestill_800t": "cinestill_800t.webp",
+  "ilford_hp5_plus_400": "ilford_hp5_plus_400.webp",
+  "kodak_tmax_100": "kodak_tmax_100.webp",
+  "fujifilm_neopan_acros_100_ii": "fujifilm_neopan_acros_100_ii.webp",
+  "fujifilm_velvia_100": "fujifilm_velvia_100.webp",
+  "fujifilm_provia_100f": "fujifilm_provia_100f.webp",
+  "kodak_ektachrome_100": "kodak_ektachrome_100.webp",
+  "kodak_kodachrome_64": "kodak_kodachrome_64.webp"
+ }
+}

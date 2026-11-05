@@ -1,0 +1,338 @@
+[
+  {
+    "id": 2,
+    "name": "酷白",
+    "nameEn": "Cool White",
+    "lut": "ku_bai.bin",
+    "strength": 0.33
+  },
+  {
+    "id": 3,
+    "name": "清爽",
+    "nameEn": "Crisp",
+    "lut": "qing_shuang.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 4,
+    "name": "鲜明",
+    "nameEn": "Vivid",
+    "lut": "xian_ming.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 5,
+    "name": "帅气灰",
+    "nameEn": "Cool Grey",
+    "lut": "shuai_qi_hui.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 6,
+    "name": "纯粹",
+    "nameEn": "Pure",
+    "lut": "chun_cui.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 7,
+    "name": "炫目",
+    "nameEn": "Dazzle",
+    "lut": "xuan_mu.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 8,
+    "name": "温婉",
+    "nameEn": "Gentle",
+    "lut": "wen_wan.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 9,
+    "name": "悦目",
+    "nameEn": "Pleasant",
+    "lut": "yue_mu.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 10,
+    "name": "唯一",
+    "nameEn": "Unique",
+    "lut": "wei_yi.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 11,
+    "name": "倾城",
+    "nameEn": "Allure",
+    "lut": "qing_cheng.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 12,
+    "name": "淡香",
+    "nameEn": "Light Scent",
+    "lut": "dan_xiang.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 13,
+    "name": "焦点",
+    "nameEn": "Focus",
+    "lut": "jiao_dian.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 14,
+    "name": "DESSERT",
+    "nameEn": "Dessert",
+    "lut": "dessert.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 15,
+    "name": "SODA",
+    "nameEn": "Soda",
+    "lut": "soda.bin",
+    "strength": 0.66
+  },
+  {
+    "id": 16,
+    "name": "FRESH",
+    "nameEn": "Fresh",
+    "lut": "fresh.bin",
+    "strength": 0.66
+  },
+  {
+    "id": 17,
+    "name": "BAKERY",
+    "nameEn": "Bakery",
+    "lut": "bakery.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 18,
+    "name": "BUFFET",
+    "nameEn": "Buffet",
+    "lut": "buffet.bin",
+    "strength": 0.66
+  },
+  {
+    "id": 19,
+    "name": "COFFEE",
+    "nameEn": "Coffee",
+    "lut": "coffee.bin",
+    "strength": 0.66
+  },
+  {
+    "id": 20,
+    "name": "高对比",
+    "nameEn": "Hi Contrast",
+    "lut": "gao_dui_bi.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 22,
+    "name": "纪实",
+    "nameEn": "Documentary",
+    "lut": "ji_shi.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 23,
+    "name": "低调",
+    "nameEn": "Low Key",
+    "lut": "di_diao.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 24,
+    "name": "蓝调",
+    "nameEn": "Blue Tone",
+    "lut": "lan_diao.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 25,
+    "name": "高调",
+    "nameEn": "High Key",
+    "lut": "gao_diao.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 26,
+    "name": "蔚然",
+    "nameEn": "Lush",
+    "lut": "wei_ran.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 27,
+    "name": "冰镇",
+    "nameEn": "Iced",
+    "lut": "bing_zhen.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 28,
+    "name": "凉风",
+    "nameEn": "Cool Breeze",
+    "lut": "liang_feng.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 29,
+    "name": "热浪",
+    "nameEn": "Heat Wave",
+    "lut": "re_lang.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 30,
+    "name": "温度",
+    "nameEn": "Warmth",
+    "lut": "wen_du.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 31,
+    "name": "刚硬",
+    "nameEn": "Hard",
+    "lut": "gang_ying.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 32,
+    "name": "柔韧",
+    "nameEn": "Soft",
+    "lut": "rou_ren.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 33,
+    "name": "厚重",
+    "nameEn": "Weighty",
+    "lut": "hou_zhong.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 34,
+    "name": "浓稠",
+    "nameEn": "Dense",
+    "lut": "nong_chou.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 35,
+    "name": "木理",
+    "nameEn": "Woodgrain",
+    "lut": "mu_li.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 36,
+    "name": "极致",
+    "nameEn": "Ultimate",
+    "lut": "ji_zhi.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 37,
+    "name": "光泽",
+    "nameEn": "Gloss",
+    "lut": "guang_ze.bin",
+    "strength": 0.8
+  },
+  {
+    "id": 38,
+    "name": "优雅",
+    "nameEn": "Elegant",
+    "lut": "you_ya.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 39,
+    "name": "精致",
+    "nameEn": "Delicate",
+    "lut": "jing_zhi.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 40,
+    "name": "时尚",
+    "nameEn": "Fashion",
+    "lut": "shi_shang.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 41,
+    "name": "文艺",
+    "nameEn": "Artsy",
+    "lut": "wen_yi.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 42,
+    "name": "沉稳",
+    "nameEn": "Steady",
+    "lut": "chen_wen.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 43,
+    "name": "迷雾",
+    "nameEn": "Mist",
+    "lut": "mi_wu.bin",
+    "strength": 0.83
+  },
+  {
+    "id": 44,
+    "name": "旺角",
+    "nameEn": "Mong Kok",
+    "lut": "wang_jiao.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 45,
+    "name": "年代",
+    "nameEn": "Retro",
+    "lut": "nian_dai.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 46,
+    "name": "颓迷",
+    "nameEn": "Decadent",
+    "lut": "tui_mi.bin",
+    "strength": 1.0
+  },
+  {
+    "id": 47,
+    "name": "高级灰",
+    "nameEn": "Muted Grey",
+    "lut": "gao_ji_hui.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 48,
+    "name": "淡盐系",
+    "nameEn": "Salt",
+    "lut": "dan_yan.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 49,
+    "name": "轻法式",
+    "nameEn": "French Light",
+    "lut": "qing_fa.bin",
+    "strength": 0.5
+  },
+  {
+    "id": 50,
+    "name": "简约白",
+    "nameEn": "Simple White",
+    "lut": "jian_yue_bai.bin",
+    "strength": 0.5
+  }
+]
