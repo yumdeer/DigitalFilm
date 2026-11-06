@@ -15,7 +15,7 @@ import {
 import { Theme } from '../common/Theme';
 import { addGrain, addHalationGlare, addScatter, addVignette, adjustTone, addFilmEdge,
   composeFilmEdge, composeMediumEdge, EdgeResult,
-  addDateBack, convertP3ToSrgb, applyColorLut } from '../engine/PostProcess';
+  addDateBack, convertP3ToSrgb, applyColorLut, applyLightLayer } from '../engine/PostProcess';
 import { postTask, PostPayload, PostResult } from '../engine/PostTask';
 import { taskpool } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -111,6 +111,32 @@ interface PaperGroup {
   papers: PaperAssets[];
 }
 
+/** Decoded light-effect sprite (opaque black-background light map). */
+interface LightTexture {
+  data: Uint8Array;
+  w: number;
+  h: number;
+}
+
+/** One light preset ported from the reference app's light_effect library. */
+interface LightPreset {
+  id: string;
+  zh: string;
+  en: string;
+  /** Default sprite width as a percentage of the frame width. */
+  scale: number;
+  /** Default layer opacity in percent. */
+  strength: number;
+}
+
+const LIGHT_PRESETS: LightPreset[] = [
+  { id: 'shanyin', zh: '山阴', en: 'SHADE', scale: 45, strength: 60 },
+  { id: 'linear', zh: '线性逆光', en: 'BACKLIGHT', scale: 45, strength: 60 },
+  { id: 'holga', zh: 'Holga', en: 'HOLGA', scale: 30, strength: 60 },
+  { id: 'cuican', zh: '璀璨', en: 'GLOW', scale: 30, strength: 60 },
+  { id: 'sunburn', zh: 'Sunburn', en: 'SUNBURN', scale: 23, strength: 60 }
+];
+
 /** Decoded film-border artwork (RGBA) for the selected stock. */
 interface EdgeTexture {
   data: Uint8Array;
@@ -177,6 +203,11 @@ interface FilterSnap {
   cropX: number;
   cropY: number;
   ev: number;
+  lightIndex: number;
+  lightStrength: number;
+  lightScale: number;
+  lightX: number;
+  lightY: number;
 }
 
 @Entry
@@ -204,6 +235,12 @@ struct Index {
   @State glare: number = 1;
   @State scatter: number = 100;
   @State vignette: number = 0;
+  /** 0 = no light layer, 1..5 index into LIGHT_PRESETS. */
+  @State lightIndex: number = 0;
+  @State lightStrength: number = 60;
+  @State lightScale: number = 45;
+  @State lightX: number = 0;
+  @State lightY: number = 0;
   @State toneContrast: number = 0;
   @State toneSaturation: number = 0;
   @State toneBrightness: number = 0;
@@ -345,6 +382,8 @@ struct Index {
       toneSaturation: this.toneSaturation, toneBrightness: this.toneBrightness,
       toneHighlights: this.toneHighlights, toneShadows: this.toneShadows,
       filmEdge: this.filmEdge, dateBack: this.dateBack,
+      lightIndex: this.lightIndex, lightStrength: this.lightStrength,
+      lightScale: this.lightScale, lightX: this.lightX, lightY: this.lightY,
       rotation: this.rotation, flipH: this.flipH, flipV: this.flipV,
       lensCorrection: this.lensCorrection, straighten: this.straighten,
       aspect: this.aspect, aspectId: this.aspectId,
@@ -376,6 +415,11 @@ struct Index {
     this.glare = s.glare;
     this.scatter = s.scatter;
     this.vignette = s.vignette;
+    this.lightIndex = s.lightIndex;
+    this.lightStrength = s.lightStrength;
+    this.lightScale = s.lightScale;
+    this.lightX = s.lightX;
+    this.lightY = s.lightY;
     this.toneContrast = s.toneContrast;
     this.toneSaturation = s.toneSaturation;
     this.toneBrightness = s.toneBrightness;
@@ -410,6 +454,7 @@ struct Index {
     this.glare = 0;
     this.scatter = 0;
     this.vignette = 0;
+    this.lightIndex = 0;
     this.toneContrast = 0;
     this.toneSaturation = 0;
     this.toneBrightness = 0;
@@ -479,6 +524,11 @@ struct Index {
   private histAcc: number[] = [];
   private baseZoom: number = 1.0;
   private basePanX: number = 0;
+  private lightBaseX: number = 0;
+  private lightBaseY: number = 0;
+  @State lightDragging: boolean = false;
+  @State lightDragX: number = 0;
+  @State lightDragY: number = 0;
   private basePanY: number = 0;
   private cropBaseX: number = 0.5;
   private cropBaseY: number = 0.5;
@@ -487,6 +537,7 @@ struct Index {
   private outW: number = 0;
   private outH: number = 0;
   private edgeTexCache: Map<string, EdgeTexture> = new Map<string, EdgeTexture>();
+  private lightTexCache: Map<string, LightTexture> = new Map<string, LightTexture>();
   private histCtx: CanvasRenderingContext2D =
     new CanvasRenderingContext2D(new RenderingContextSettings(true));
 
@@ -931,8 +982,47 @@ struct Index {
     }
   }
 
+  /**
+   * Light sprites are opaque black-background light maps from the reference
+   * app, so they only need a screen blend; the cache mirrors the edge artwork.
+   */
+  private async ensureLightTexture(): Promise<LightTexture | null> {
+    if (this.lightIndex <= 0 || this.filtersOff || this.lightStrength <= 0 ||
+      this.rm === undefined) {
+      return null;
+    }
+    const preset: LightPreset = LIGHT_PRESETS[this.lightIndex - 1];
+    const cached: LightTexture | undefined = this.lightTexCache.get(preset.id);
+    if (cached !== undefined) {
+      return cached;
+    }
+    try {
+      const raw: Uint8Array = await this.rm.getRawFileContent('light/' + preset.id + '.webp');
+      const ab: ArrayBuffer = raw.buffer.slice(raw.byteOffset,
+        raw.byteOffset + raw.byteLength) as ArrayBuffer;
+      const isrc: image.ImageSource = image.createImageSource(ab);
+      const pm: image.PixelMap = await isrc.createPixelMap({
+        desiredPixelFormat: image.PixelMapFormat.RGBA_8888
+      });
+      const info: image.ImageInfo = await pm.getImageInfo();
+      const data: Uint8Array =
+        new Uint8Array(info.size.width * info.size.height * 4);
+      await pm.readPixelsToBuffer(data.buffer as ArrayBuffer);
+      const tex: LightTexture = { data: data, w: info.size.width, h: info.size.height };
+      if (this.lightTexCache.size >= 2) {
+        this.lightTexCache.clear();
+      }
+      this.lightTexCache.set(preset.id, tex);
+      await pm.release();
+      return tex;
+    } catch (e) {
+      console.warn('light texture unavailable: ' + JSON.stringify(e));
+      return null;
+    }
+  }
+
   private applyPost(pixels: Uint8Array, w: number, h: number,
-                    tex: EdgeTexture | null): PostResult {
+                    tex: EdgeTexture | null, light: LightTexture | null): PostResult {
     if (this.filtersOff) {
       return { pixels: pixels, w: w, h: h, stageMs: 'original' };
     }
@@ -945,6 +1035,12 @@ struct Index {
     const lut: Uint8Array | undefined = this.cachedLut();
     if (lut !== undefined) {
       applyColorLut(pixels, w, h, lut, this.lutMix());
+    }
+    // The light sits on the print, before the decorative frame is composited.
+    if (light !== null && this.lightStrength > 0) {
+      applyLightLayer(pixels, w, h, light.data, light.w, light.h,
+        this.lightStrength / 100.0, Math.max(0.01, this.lightScale / 100.0),
+        this.lightX / 100.0, this.lightY / 100.0);
     }
     let edge: EdgeResult;
     if (tex === null) {
@@ -1015,6 +1111,7 @@ struct Index {
     if (this.filtersOff) {
       return { pixels: pixels, w: w, h: h, stageMs: 'original' };
     }
+    const light: LightTexture | null = await this.ensureLightTexture();
     const payload: PostPayload = {
       pixels: pixels, w: w, h: h,
       halation: this.halation / 100.0, glare: this.glare / 30.0,
@@ -1028,13 +1125,20 @@ struct Index {
       edgePpm: tex !== null ? tex.ppm : 0,
       edgeRotate: h > w,
       dateBack: this.dateBack, dateText: this.dateStamp(),
-      lut: await this.currentLut(), lutStrength: this.lutMix()
+      lut: await this.currentLut(), lutStrength: this.lutMix(),
+      lightTex: light !== null ? light.data.slice() : undefined,
+      lightW: light !== null ? light.w : 0,
+      lightH: light !== null ? light.h : 0,
+      lightOpacity: this.lightStrength / 100.0,
+      lightScale: Math.max(0.01, this.lightScale / 100.0),
+      lightOffX: this.lightX / 100.0,
+      lightOffY: this.lightY / 100.0
     };
     try {
       return (await taskpool.execute(new taskpool.Task(postTask, payload))) as PostResult;
     } catch (e) {
       console.warn('taskpool post unavailable, using main thread');
-      return this.applyPost(pixels, w, h, tex);
+      return this.applyPost(pixels, w, h, tex, light);
     }
   }
 
@@ -1674,39 +1778,13 @@ struct Index {
     .width(40)
   }
 
-  /** Stylised paper carton: maker band above the paper label. */
+  /** Blender 渲染的相纸包装盒：三种厂商版式，统一 240x240 素材。 */
   @Builder
-  paperBoxArt(band: string, brand: string) {
-    Column() {
-      Row()
-        .width(40)
-        .height(9)
-        .backgroundColor(band)
-      Column() {
-        Text(brand)
-          .fontSize(5.5)
-          .fontColor('#26251F')
-          .letterSpacing(0.3)
-          .maxLines(1)
-        Text('PAPER')
-          .fontSize(4.5)
-          .fontColor('#8A8578')
-          .letterSpacing(0.8)
-          .margin({ top: 1 })
-      }
+  paperBoxArt(id: string) {
+    Image($rawfile('paper-box/' + id + '.webp'))
       .width(40)
-      .height(24)
-      .justifyContent(FlexAlign.Center)
-      .backgroundColor('#EFE9D8')
-      Row()
-        .width(40)
-        .height(9)
-        .backgroundColor('#EFE9D8')
-    }
-    .width(40)
-    .borderRadius(3)
-    .clip(true)
-    .border({ width: 1, color: '#00000033' })
+      .height(40)
+      .objectFit(ImageFit.Contain)
   }
 
   @Builder
@@ -1773,7 +1851,7 @@ struct Index {
   @Builder
   paperRow(p: PaperAssets, i: number) {
     Row() {
-      this.paperBoxArt(this.paperBrandColor(p.id), this.paperBrand(p.name))
+      this.paperBoxArt(p.id)
       Column() {
         Text(p.name)
           .fontSize(11)
@@ -1911,38 +1989,9 @@ struct Index {
   paperSelector() {
     Row() {
       if (this.isPositiveFilm()) {
-        this.paperBoxArt('#8A8578', 'SCAN')
+        this.paperBoxArt('scan')
       } else if (this.currentPaper() !== undefined) {
-        Column() {
-          Row()
-            .width(40)
-            .height(9)
-            .backgroundColor(this.paperBrandColor(this.currentPaper()!.id))
-          Column() {
-            Text(this.paperBrand(this.currentPaper()!.name))
-              .fontSize(5.5)
-              .fontColor('#26251F')
-              .letterSpacing(0.3)
-              .maxLines(1)
-            Text('PAPER')
-              .fontSize(4.5)
-              .fontColor('#8A8578')
-              .letterSpacing(0.8)
-              .margin({ top: 1 })
-          }
-          .width(40)
-          .height(24)
-          .justifyContent(FlexAlign.Center)
-          .backgroundColor('#EFE9D8')
-          Row()
-            .width(40)
-            .height(9)
-            .backgroundColor('#EFE9D8')
-        }
-        .width(40)
-        .borderRadius(3)
-        .clip(true)
-        .border({ width: 1, color: '#00000033' })
+        this.paperBoxArt(this.currentPaper()!.id)
       }
       Column() {
         Text(this.isPositiveFilm()
@@ -2149,6 +2198,31 @@ struct Index {
       .margin({ right: 6 })
       .onClick(() => {
         this.resetToOriginal();
+      })
+  }
+
+  @Builder
+  lightChip(index: number, zh: string, en: string) {
+    Text(this.t(zh, en))
+      .fontSize(9)
+      .fontColor(this.lightIndex === index ? Theme.onSelection : Theme.secondary)
+      .backgroundColor(this.lightIndex === index ? Theme.selection : Theme.card)
+      .border({ width: 1, color: this.lightIndex === index ? Theme.selection : Theme.rule })
+      .borderRadius(2)
+      .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+      .margin({ right: 6, bottom: 4 })
+      .onClick(() => {
+        this.pushUndo();
+        this.leaveOriginal();
+        this.lightIndex = index;
+        if (index > 0) {
+          const p: LightPreset = LIGHT_PRESETS[index - 1];
+          this.lightStrength = p.strength;
+          this.lightScale = p.scale;
+          this.lightX = 0;
+          this.lightY = 0;
+        }
+        this.renderPreview();
       })
   }
 
@@ -2761,6 +2835,128 @@ struct Index {
       .alignItems(VerticalAlign.Center)
 
       Row() {
+        this.headerLabel('灯光', 'LIGHT')
+        Blank()
+        Text(this.t('灯光素材', 'LIGHT SETS'))
+          .fontSize(7.5)
+          .letterSpacing(0.6)
+          .fontColor(Theme.dim)
+      }
+      .width('100%')
+      .margin({ top: 6 })
+
+      Flex({ wrap: FlexWrap.Wrap }) {
+        this.lightChip(0, '无', 'NONE')
+        ForEach(LIGHT_PRESETS, (p: LightPreset, i: number) => {
+          this.lightChip(i + 1, p.zh, p.en)
+        }, (p: LightPreset) => p.id)
+      }
+      .width('100%')
+      .margin({ top: 2 })
+
+      if (this.lightIndex > 0) {
+        Row() {
+          this.hintLabel('强度', 'STRENGTH',
+            '灯光强度：整层叠加不透明度',
+            'Light strength: overall layer opacity')
+          Slider({ value: this.lightStrength, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
+          .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .selectedColor(Theme.accent)
+            .trackColor(Theme.rule)
+            .layoutWeight(1)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightStrength = value;
+              if (mode === SliderChangeMode.End) {
+                this.renderPreview();
+              }
+            })
+          Text(Math.round(this.lightStrength).toString())
+            .fontSize(10)
+            .fontColor(Theme.secondary)
+            .width(30)
+            .textAlign(TextAlign.End)
+        }
+        .width('100%')
+        .margin({ top: 2 })
+        .alignItems(VerticalAlign.Center)
+
+        Row() {
+          this.hintLabel('大小', 'SIZE',
+            '灯光大小：光斑占画面宽度的百分比',
+            'Light size: sprite width as a percentage of the frame')
+          Slider({ value: this.lightScale, min: 10, max: 250, step: 1, style: SliderStyle.InSet })
+          .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .selectedColor(Theme.accent)
+            .trackColor(Theme.rule)
+            .layoutWeight(1)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightScale = value;
+              if (mode === SliderChangeMode.End) {
+                this.renderPreview();
+              }
+            })
+          Text(Math.round(this.lightScale).toString())
+            .fontSize(10)
+            .fontColor(Theme.secondary)
+            .width(30)
+            .textAlign(TextAlign.End)
+        }
+        .width('100%')
+        .margin({ top: 2 })
+        .alignItems(VerticalAlign.Center)
+
+        Row() {
+          this.hintLabel('横向', 'MOVE X',
+            '灯光横向位置',
+            'Light horizontal position')
+          Slider({ value: this.lightX, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
+          .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .selectedColor(Theme.accent)
+            .trackColor(Theme.rule)
+            .layoutWeight(1)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightX = value;
+              if (mode === SliderChangeMode.End) {
+                this.renderPreview();
+              }
+            })
+          Text(Math.round(this.lightX).toString())
+            .fontSize(10)
+            .fontColor(Theme.secondary)
+            .width(30)
+            .textAlign(TextAlign.End)
+        }
+        .width('100%')
+        .margin({ top: 2 })
+        .alignItems(VerticalAlign.Center)
+
+        Row() {
+          this.hintLabel('纵向', 'MOVE Y',
+            '灯光纵向位置',
+            'Light vertical position')
+          Slider({ value: this.lightY, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
+          .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .selectedColor(Theme.accent)
+            .trackColor(Theme.rule)
+            .layoutWeight(1)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightY = value;
+              if (mode === SliderChangeMode.End) {
+                this.renderPreview();
+              }
+            })
+          Text(Math.round(this.lightY).toString())
+            .fontSize(10)
+            .fontColor(Theme.secondary)
+            .width(30)
+            .textAlign(TextAlign.End)
+        }
+        .width('100%')
+        .margin({ top: 2 })
+        .alignItems(VerticalAlign.Center)
+      }
+
+      Row() {
         this.hintLabel('胶片框', 'FRAME MARKS',
           '片边：加上齿孔边框；日期背印：加橙色日期戳',
           'Film edge adds sprocket borders; date back stamps an orange date')
@@ -3256,6 +3452,10 @@ struct Index {
                     this.basePanY = this.panY;
                     this.cropBaseX = this.cropX;
                     this.cropBaseY = this.cropY;
+                    this.lightBaseX = this.lightX;
+                    this.lightBaseY = this.lightY;
+                    this.lightDragging = this.zoomK <= 1.0 && this.lightIndex > 0 &&
+                      this.effAspect() <= 0.0;
                   })
                   .onActionUpdate((e: GestureEvent) => {
                     if (this.zoomK > 1.0) {
@@ -3269,6 +3469,17 @@ struct Index {
                       const maxY: number = sh[1] * 2.0 * s;
                       this.cropDx = Math.max(-maxX, Math.min(maxX, e.offsetX));
                       this.cropDy = Math.max(-maxY, Math.min(maxY, e.offsetY));
+                    } else if (this.lightIndex > 0) {
+                      // 选中灯光后，直接在画面上拖动光源：跟手比 1:1。
+                      const s: number = this.previewScale();
+                      const dw: number = this.outW > 0 ? this.outW * s : this.previewW;
+                      const dh: number = this.outH > 0 ? this.outH * s : this.previewH;
+                      this.lightX = Math.max(-100, Math.min(100,
+                        this.lightBaseX + e.offsetX / Math.max(1, dw) * 100));
+                      this.lightY = Math.max(-100, Math.min(100,
+                        this.lightBaseY + e.offsetY / Math.max(1, dh) * 100));
+                      this.lightDragX = this.lightX / 100.0 * dw;
+                      this.lightDragY = this.lightY / 100.0 * dh;
                     }
                   })
                   .onActionEnd(() => {
@@ -3287,13 +3498,27 @@ struct Index {
                       this.cropDx = 0;
                       this.cropDy = 0;
                       this.renderPreview();
+                    } else if (this.zoomK <= 1.0 && this.lightIndex > 0 &&
+                      (this.lightX !== this.lightBaseX || this.lightY !== this.lightBaseY)) {
+                      this.renderPreview();
                     }
+                    this.lightDragging = false;
                   })
               )
             )
             .onClick(() => {
               this.showOriginal = !this.showOriginal;
             })
+
+          if (this.lightDragging) {
+            Column()
+              .width(26)
+              .height(26)
+              .borderRadius(13)
+              .border({ width: 1.5, color: Theme.accent })
+              .translate({ x: this.lightDragX, y: this.lightDragY })
+              .hitTestBehavior(HitTestMode.None)
+          }
         } else {
           this.emptyState()
         }

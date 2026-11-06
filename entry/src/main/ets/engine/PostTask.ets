@@ -4,7 +4,7 @@
 
 import { addHalationGlare, addScatter, addVignette, adjustTone, addFilmEdge,
   addDateBack, convertP3ToSrgb, applyColorLut, composeFilmEdge, composeMediumEdge,
-  EdgeResult } from './PostProcess';
+  applyLightLayer, EdgeResult } from './PostProcess';
 
 export interface PostPayload {
   pixels: Uint8Array;
@@ -32,6 +32,14 @@ export interface PostPayload {
   /** Built-in filter table (empty when the film path is active). */
   lut: Uint8Array;
   lutStrength: number;
+  /** Optional light-effect sprite (opaque light map) laid over the print. */
+  lightTex?: Uint8Array;
+  lightW?: number;
+  lightH?: number;
+  lightOpacity?: number;
+  lightScale?: number;
+  lightOffX?: number;
+  lightOffY?: number;
 }
 
 export interface PostResult {
@@ -61,6 +69,16 @@ export function postTask(p: PostPayload): PostResult {
   // after the display-space conversion and before the frame decoration.
   if (p.lut.length > 0 && p.lutStrength > 0) {
     applyColorLut(px, p.w, p.h, p.lut, p.lutStrength);
+  }
+  // Light sprites sit on the print itself, before the frame decoration, so a
+  // film edge never gets washed out by the lamp overlay.
+  if (p.lightTex !== undefined && p.lightW !== undefined && p.lightH !== undefined &&
+    p.lightW > 0 && p.lightH > 0 && p.lightOpacity !== undefined &&
+    p.lightOpacity > 0 && p.lightScale !== undefined) {
+    applyLightLayer(px, p.w, p.h, p.lightTex, p.lightW, p.lightH,
+      p.lightOpacity, p.lightScale,
+      p.lightOffX === undefined ? 0.0 : p.lightOffX,
+      p.lightOffY === undefined ? 0.0 : p.lightOffY);
   }
   const t4: number = Date.now();
   let edge: EdgeResult;

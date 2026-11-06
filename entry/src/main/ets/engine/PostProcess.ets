@@ -1032,3 +1032,68 @@ export function applyColorLut(pixels: Uint8Array, w: number, h: number,
     }
   }
 }
+
+
+/**
+ * Light-effect overlay ported from the reference app's light_effect library.
+ * Each sprite is an opaque black-background light map, so the layer is an
+ * additive (linear-dodge) blend: black leaves the print untouched and the lit
+ * part adds its own light on top, which also reads on already-bright areas.
+ * `opacity` scales the whole layer, `scale` is the sprite width as a fraction
+ * of the frame width, and the offsets shift it in frame units.
+ */
+export function applyLightLayer(pixels: Uint8Array, w: number, h: number,
+                                tex: Uint8Array, tw: number, th: number,
+                                opacity: number, scale: number,
+                                offX: number, offY: number): void {
+  if (opacity <= 0.0 || tw <= 0 || th <= 0 || w <= 0 || h <= 0) {
+    return;
+  }
+  const dw: number = Math.max(1.0, w * scale);
+  const dh: number = Math.max(1.0, dw * th / tw);
+  const left: number = (w - dw) / 2.0 + offX * w;
+  const top: number = (h - dh) / 2.0 + offY * h;
+  const x0: number = Math.max(0, Math.floor(left));
+  const x1: number = Math.min(w, Math.ceil(left + dw));
+  const y0: number = Math.max(0, Math.floor(top));
+  const y1: number = Math.min(h, Math.ceil(top + dh));
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  const stepX: number = tw / dw;
+  const stepY: number = th / dh;
+  const lastX: number = tw - 1;
+  const lastY: number = th - 1;
+  for (let y = y0; y < y1; y++) {
+    const fy: number = (y + 0.5 - top) * stepY - 0.5;
+    const iy: number = Math.floor(fy);
+    const wy: number = fy - iy;
+    const r0: number = (iy < 0 ? 0 : (iy > lastY ? lastY : iy)) * tw;
+    const r1: number = (iy + 1 < 0 ? 0 : (iy + 1 > lastY ? lastY : iy + 1)) * tw;
+    const w00: number = 1.0 - wy;
+    const row: number = y * w;
+    for (let x = x0; x < x1; x++) {
+      const fx: number = (x + 0.5 - left) * stepX - 0.5;
+      const ix: number = Math.floor(fx);
+      const wx: number = fx - ix;
+      const c0: number = (ix < 0 ? 0 : (ix > lastX ? lastX : ix)) * 4;
+      const c1: number = (ix + 1 < 0 ? 0 : (ix + 1 > lastX ? lastX : ix + 1)) * 4;
+      const a: number = r0 * 4 + c0;
+      const b: number = r0 * 4 + c1;
+      const c: number = r1 * 4 + c0;
+      const dd: number = r1 * 4 + c1;
+      const p: number = (row + x) * 4;
+      const k00: number = (1.0 - wx) * w00;
+      const k10: number = wx * w00;
+      const k01: number = (1.0 - wx) * wy;
+      const k11: number = wx * wy;
+      for (let ch = 0; ch < 3; ch++) {
+        const s: number = (tex[a + ch] * k00 + tex[b + ch] * k10 +
+          tex[c + ch] * k01 + tex[dd + ch] * k11) / 255.0;
+        const base: number = pixels[p + ch] / 255.0;
+        const v: number = (base + s * opacity) * 255.0;
+        pixels[p + ch] = v > 255.0 ? 255.0 : Math.round(v);
+      }
+    }
+  }
+}
