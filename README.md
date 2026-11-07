@@ -1,97 +1,64 @@
 # DigitalFilm
 
-HarmonyOS 胶片相机应用：导入照片，套用胶片 + 相纸 + 光线效果，导出成片。
+一个鸿蒙（HarmonyOS）胶片相机应用：把手机里普通的照片，做成胶片拍出来、相纸印出来的样子。
 
-- 包名：`com.spektra.spektralab`
-- 版本：1.0.0（versionCode 1000000）
-- 支持设备：phone / tablet / 2in1
+导入一张照片，选一款胶卷、一种相纸，再叠一层漏光，就能得到带颗粒、暗角、色彩偏移和纸边的成片。
 
-## 功能
+## 它能做什么
 
-| 模块 | 说明 |
-| --- | --- |
-| 胶片 | 24 款胶卷（负片 / 正片 / 黑白），前后各一层，可叠加 |
-| 相纸 | 9 种打印相纸 LUT，与胶卷串联模拟完整冲印链路 |
-| 内置滤镜 | 独立 LUT 表，与胶卷互斥 |
-| 灯光 | 5 种漏光/光斑素材，支持拖动定位、双指缩放、旋转、删除，任意编辑页签都能编辑 |
-| 光学 | 曝光补偿（含自动测光）、眩光、散射、暗角、色调 |
-| 构图 | 画面比例、旋转 / 镜像、镜头畸变校正、校平、裁剪 |
-| 调色 | 颗粒、对比、高光、阴影、色温等 |
-| 输出 | 3000 / 2048 / 1080 三档长边，PNG / JPEG |
+- **换胶卷**：24 款负片、正片、黑白胶卷，支持前后两层叠加
+- **选相纸**：9 种打印相纸，和胶卷串联起来模拟从拍摄到冲洗的完整色彩链路
+- **加漏光**：5 种漏光、光斑素材，可以直接在画面上拖动位置、双指缩放、旋转，多盏叠加
+- **调光学**：曝光补偿与自动测光、眩光、散射、暗角、色调
+- **改构图**：画面比例、旋转、镜像、镜头畸变校正、校平、裁剪
+- **精调色**：颗粒、对比、高光、阴影、色温
+- **导出**：3000 / 2048 / 1080 三档长边，PNG 或 JPEG，写入 EXIF
 
-渲染链路：几何变换 → 胶片模拟 → 调色（光晕/散射/暗角/色调/LUT）→ 灯光/片边/日期 → 直方图。
-所有像素运算通过 taskpool 放到子线程，UI 线程只做叠加层预览。
+所有处理都在本机完成，不联网、不上传，也不收集个人信息。
 
-## 一多适配（一次开发，多端部署）
+## 支持设备
 
-按窗口宽度断点自适应，不是简单的拉伸：
+- 系统：HarmonyOS 5.0（API 12）及以上
+- 设备：手机、平板、2in1
 
-| 断点 | 宽度(vp) | 布局 |
-| --- | --- | --- |
-| xs | < 320 | 底部面板（紧凑） |
-| sm | 320 – 600 | 底部面板（手机竖屏） |
-| md | 600 – 840 | 底部面板；窗口高度 < 500vp 时改侧栏（横屏手机） |
-| lg | 840 – 1440 | 常驻左侧栏 340vp + 画布 |
-| xl | ≥ 1440 | 常驻左侧栏 400vp + 画布 |
+界面会按屏幕宽度自动切换：手机用底部控制面板，平板与 2in1 横屏改成左侧常驻面板；在 2in1 上还可以用鼠标滚轮缩放画布。
 
-- 断点来源：`window.getWindowProperties()` + `windowSizeChange` 监听，窗口拖拽实时切换
-- 安全区：沉浸式铺满 + `getWindowAvoidArea` 读取状态栏/导航条高度补内边距，监听 `avoidAreaChange`
-- 2in1：鼠标滚轮触发 PanGesture 的轴向事件，按光标位置缩放画布 1x–8x
+## 隐私
 
-## 目录结构
+- 不申请任何系统权限
+- 不发起网络请求，无第三方 SDK
+- 选图使用系统图库选择器，成片通过系统保存确认框写入相册
+- 首次启动会展示隐私说明，同意后才加载素材
 
-```
-AppScope/                 应用级配置与图标
-entry/src/main/ets/
-  entryability/           UIAbility 入口
-  pages/Index.ets         主界面（画布、手势、面板、一多布局）
-  engine/                 渲染引擎
-    SpectralEngine.ets      素材清单、胶片/相纸加载、像素渲染
-    PostProcess.ets         光学后期（颗粒/光晕/散射/暗角/后期调色/片边）
-    PostTask.ets            taskpool 后期任务
-    GeoTask.ets / Geometry.ets  旋转、裁剪、校平、畸变校正
-    RenderTask.ets          分片渲染
-    Exif.ets                EXIF 写入
-    ImageImport.ets         图片导入
-  common/Theme.ets        配色与字体
-  resources/rawfile/      胶片、相纸、灯光素材（webp / 纹理）
-store/                    华为应用市场上架材料（图标、截图、隐私政策、提交清单）
-```
+## 开发与构建
 
-## 构建与运行
-
-环境：DevEco Studio 5.x（HarmonyOS SDK API 12）。
+需要 DevEco Studio 5.x（HarmonyOS SDK API 12）。
 
 ```bash
 # 调试包
 hvigorw assembleHap --mode module -p product=default -p buildMode=debug --no-daemon
 
-# 上架用 App Pack（AGC 只接受 .app）
-hvigorw assembleApp -p product=default -p buildMode=release --no-daemon
-```
-
-签名：仓库默认使用 DevEco 自动生成的调试证书；上架需替换为 AGC 下发的发布证书（`.p12` / `.cer` / `.p7b`），流程见 `store/SUBMISSION.md`。
-
-真机安装：
-
-```bash
+# 真机安装并启动
 hdc install -r entry/build/default/outputs/default/entry-default-signed.hap
 hdc shell aa start -a EntryAbility -b com.spektra.spektralab
 ```
 
-## 隐私
+目录说明：
 
-不申请任何系统权限，无网络请求，无第三方 SDK，不收集个人信息。
-选图走系统 PhotoViewPicker，保存走系统保存确认框写入相册。
-首次启动弹出隐私政策告知，未同意前不加载任何素材。
+```
+entry/src/main/ets/
+  pages/Index.ets          主界面：画布、手势、控制面板、多端布局
+  engine/                  渲染引擎
+    SpectralEngine.ets       素材清单、胶片/相纸加载、像素渲染
+    PostProcess.ets          颗粒、光晕、散射、暗角、后期调色、片边
+    PostTask.ets             taskpool 后期任务
+    GeoTask.ets / Geometry.ets  旋转、裁剪、校平、畸变校正
+    RenderTask.ets           分片渲染
+    Exif.ets                 EXIF 写入
+    ImageImport.ets          图片导入
+  common/Theme.ets         配色与字体
+  resources/rawfile/       胶片、相纸、灯光素材
+```
 
-完整政策文本见 `store/privacy-policy.html`。
-
-## 上架
-
-`store/` 目录包含 AGC 可直接使用的材料与分步清单：
-
-- `SUBMISSION.md`：上架步骤、必需资质（APP 备案为强制，软著为非必选）、驳回自检表
-- `icons/icon-216.png`、`icons/icon-512.png`
-- `screenshots/screenshot-1..5.jpg`（1080×1920）
-- `privacy-policy.html`
+渲染链路：几何变换 → 胶片模拟 → 调色（光晕/散射/暗角/色调/LUT）→ 灯光/片边/日期 → 直方图。
+像素运算全部通过 taskpool 放在子线程，主线程只负责叠加层预览。
