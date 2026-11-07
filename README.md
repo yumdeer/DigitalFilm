@@ -59,3 +59,8 @@ entry/src/main/ets/
   common/Theme.ets         配色与字体
   resources/rawfile/       胶片、相纸、灯光素材
 ```
+
+## 许可证
+
+本项目基于 [GNU General Public License v3.0](LICENSE) 发布，可自由使用、修改和分发；
+基于本项目代码的衍生作品在分发时同样需要以 GPL-3.0 开源。
