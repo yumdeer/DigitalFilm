@@ -59,6 +59,3 @@ entry/src/main/ets/
   common/Theme.ets         配色与字体
   resources/rawfile/       胶片、相纸、灯光素材
 ```
-
-渲染链路：几何变换 → 胶片模拟 → 调色（光晕/散射/暗角/色调/LUT）→ 灯光/片边/日期 → 直方图。
-像素运算全部通过 taskpool 放在子线程，主线程只负责叠加层预览。
