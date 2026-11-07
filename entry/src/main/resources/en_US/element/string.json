@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "DigitalFilm film simulation"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "DigitalFilm film simulation"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "DigitalFilm"
     },
     {
       "name": "EntryFormAbility_desc",

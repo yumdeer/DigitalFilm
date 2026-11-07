@@ -7,6 +7,7 @@ import { resourceManager } from '@kit.LocalizationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { colorSpaceManager, drawing } from '@kit.ArkGraphics2D';
 import { promptAction, window } from '@kit.ArkUI';
+import { preferences } from '@kit.ArkData';
 import {
   loadManifest, loadFilm, loadPaper, renderPixels, centerWeightedEv, meterEv,
   loadFilterCatalog, loadFilterLut,
@@ -25,6 +26,11 @@ import { rotate90, straighten, flip, correctLens, resizeBox, GeoResult } from '.
 import { geometryTask, GeometryPayload } from '../engine/GeoTask';
 import { buildExifApp1, insertExif, exifTimestamp } from '../engine/Exif';
 import { IMAGE_SUFFIX_FILTER, OpenedImage, openImageSource } from '../engine/ImageImport';
+
+/** 隐私政策公网地址：静态页部署完成后替换成最终 URL（必须无需登录即可访问）。 */
+const PRIVACY_URL: string = 'https://example.github.io/digitalfilm/privacy.html';
+const PREF_STORE: string = 'digitalfilm_prefs';
+const PREF_PRIVACY_KEY: string = 'privacy_agreed_v1';
 
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -352,6 +358,8 @@ struct Index {
   @State paperIndex: number = 0;
   /** 0 closed, 1 film library, 2 paper library. */
   @State pickMode: number = 0;
+  /** 首次启动的隐私政策弹窗：用户同意前不加载任何素材、不读写相册。 */
+  @State privacyPending: boolean = false;
   @State ev: number = 0;
   @State autoExposure: boolean = true;
   @State showOriginal: boolean = false;
@@ -1380,6 +1388,18 @@ struct Index {
   private cropBaseY: number = 0.5;
   private viewW: number = 0;
   private viewH: number = 0;
+  /** 一多断点：xs<320 / sm<600 / md<840 / lg<1440 / xl>=1440（单位 vp）。 */
+  @State winW: number = 0;
+  @State winH: number = 0;
+  /** 安全区避让：状态栏 / 导航条（vp）。 */
+  @State safeTop: number = 0;
+  @State safeBottom: number = 0;
+  /** 常驻侧栏实测高度（vp），用于让侧栏内的滚动区自适应。 */
+  @State sideH: number = 0;
+  /** 鼠标滚轮触发的 PanGesture 期间为 true，避免被当成拖动。 */
+  private wheelOn: boolean = false;
+  private hoverX: number = -1;
+  private hoverY: number = -1;
   private outW: number = 0;
   private outH: number = 0;
   private edgeTexCache: Map<string, EdgeTexture> = new Map<string, EdgeTexture>();
@@ -1389,7 +1409,208 @@ struct Index {
 
   aboutToAppear(): void {
     this.drawerOpen = true;
+    this.checkPrivacy();
+    this.setupWindow();
+  }
+
+  /** 断点判定：返回当前窗口宽度所属档位。 */
+  private bp(): string {
+    const w: number = this.winW;
+    if (w < 320) { return 'xs'; }
+    if (w < 600) { return 'sm'; }
+    if (w < 840) { return 'md'; }
+    if (w < 1440) { return 'lg'; }
+    return 'xl';
+  }
+
+  /** lg / xl 用常驻左侧栏，其余档位继续用底部面板。 */
+  private isWide(): boolean {
+    const b: string = this.bp();
+    // 横屏手机这类「宽而矮」的窗口也用侧栏，否则底部面板会吃掉大半个画布。
+    return b === 'lg' || b === 'xl' || (b === 'md' && this.winH > 0 && this.winH < 500);
+  }
+
+  private sideW(): number {
+    return this.bp() === 'xl' ? 400 : 340;
+  }
+
+  /** 侧栏内滚动区高度：扣掉页签行、滑杆行和底部按钮占位。 */
+  private panelScrollH(): number {
+    if (!this.isWide()) {
+      return 238;
+    }
+    const h: number = this.sideH > 0 ? this.sideH : (this.winH > 0 ? this.winH : 800);
+    const reserved: number = this.drawerTab === 3 ? 210 : 170;
+    return Math.max(180, h - reserved);
+  }
+
+  /** 窗口尺寸与安全区：沉浸式铺满后按避让区补内边距。 */
+  private async setupWindow(): Promise<void> {
+    try {
+      const win: window.Window = await window.getLastWindow(getContext(this) as common.UIAbilityContext);
+      const rect: window.Rect = win.getWindowProperties().windowRect;
+      this.winW = px2vp(rect.width);
+      this.winH = px2vp(rect.height);
+      this.syncAvoid(win);
+      win.on('windowSizeChange', (size: window.Size) => {
+        this.winW = px2vp(size.width);
+        this.winH = px2vp(size.height);
+      });
+      win.on('avoidAreaChange', (_data: window.AvoidAreaOptions) => {
+        this.syncAvoid(win);
+      });
+      await win.setWindowLayoutFullScreen(true);
+    } catch (e) {
+      hilog.warn(0x0000, 'digitalfilm', 'window setup failed: %{public}s', JSON.stringify(e) ?? '');
+    }
+  }
+
+  /** 读取系统避让区：顶部取状态栏，底部取系统栏与导航条的较大值。 */
+  private syncAvoid(win: window.Window): void {
+    try {
+      const sys: window.AvoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      const nav: window.AvoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
+      this.safeTop = Math.max(0, px2vp(sys.topRect.height));
+      this.safeBottom = Math.max(0, Math.max(px2vp(sys.bottomRect.height), px2vp(nav.bottomRect.height)));
+    } catch (e) {
+      this.safeTop = 0;
+      this.safeBottom = 0;
+    }
+  }
+
+  /** 鼠标滚轮触发的 PanGesture 只带轴向增量，用来源+轴值区分。 */
+  private isWheel(e: GestureEvent): boolean {
+    const v: number = e.axisVertical !== undefined ? e.axisVertical : 0;
+    const h: number = e.axisHorizontal !== undefined ? e.axisHorizontal : 0;
+    return e.source === SourceType.Mouse && (Math.abs(v) > 0 || Math.abs(h) > 0);
+  }
+
+  /** 以光标为锚点缩放预览（1x~8x）。 */
+  private wheelZoom(axis: number): void {
+    const z0: number = this.zoomK;
+    const factor: number = 1.0 - Math.max(-0.2, Math.min(0.2, axis * 0.05));
+    const z1: number = Math.max(1.0, Math.min(8.0, z0 * factor));
+    if (z1 === z0) {
+      return;
+    }
+    const cx: number = (this.hoverX >= 0 ? this.hoverX : this.viewW / 2) - this.viewW / 2;
+    const cy: number = (this.hoverY >= 0 ? this.hoverY : this.viewH / 2) - this.viewH / 2;
+    this.panX = cx - (cx - this.panX) * (z1 / z0);
+    this.panY = cy - (cy - this.panY) * (z1 / z0);
+    this.zoomK = z1;
+    if (z1 <= 1.0) {
+      this.panX = 0;
+      this.panY = 0;
+    }
+  }
+
+  /** 读取本地记录的同意状态：没同意过就先弹隐私政策，同意后再加载素材。 */
+  private checkPrivacy(): void {
+    preferences.getPreferences(getContext(this), PREF_STORE).then((pref: preferences.Preferences) => {
+      const agreed: boolean = pref.getSync(PREF_PRIVACY_KEY, false) as boolean;
+      if (agreed) {
+        this.initAssets();
+      } else {
+        this.privacyPending = true;
+      }
+    }).catch(() => {
+      this.privacyPending = true;
+    });
+  }
+
+  /** 同意隐私政策：落盘后继续启动流程。 */
+  private agreePrivacy(): void {
+    this.privacyPending = false;
+    preferences.getPreferences(getContext(this), PREF_STORE).then((pref: preferences.Preferences) => {
+      pref.putSync(PREF_PRIVACY_KEY, true);
+      pref.flush();
+    }).catch(() => {});
     this.initAssets();
+  }
+
+  /** 不同意：直接退出，不进入任何功能。 */
+  private declinePrivacy(): void {
+    const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+    ctx.terminateSelf();
+  }
+
+  /** 打开隐私政策网页。 */
+  private openPrivacyPolicy(): void {
+    const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+    ctx.startAbility({
+      action: 'ohos.want.action.viewData',
+      entities: ['entity.system.browsable'],
+      uri: PRIVACY_URL
+    }).catch((err: BusinessError) => {
+      promptAction.showToast({ message: '无法打开浏览器：' + (err.message ? err.message : '') });
+    });
+  }
+
+  /** 首次启动的隐私政策告知弹窗：必须提供明确的同意 / 拒绝入口。 */
+  @Builder
+  privacyGate() {
+    Column() {
+      Column({ space: 14 }) {
+        Text('隐私政策')
+          .fontSize(18)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.text)
+        Scroll() {
+          Column({ space: 10 }) {
+            Text('DigitalFilm 是一款完全在本地运行的胶片模拟相机：不采集、不上传任何个人信息，也不申请任何系统权限。你选择的照片只在本机内存中参与渲染，成片由系统「保存到图库」确认框写入相册，无需授予存储权限。')
+              .fontSize(13)
+              .lineHeight(21)
+              .fontColor(Theme.secondary)
+              .width('100%')
+            Text('《DigitalFilm 隐私政策》')
+              .fontSize(13)
+              .fontColor(Theme.accent)
+              .width('100%')
+              .onClick(() => this.openPrivacyPolicy())
+            Text('点击「同意并继续」表示你已阅读并同意上述政策。')
+              .fontSize(12)
+              .fontColor(Theme.dim)
+              .width('100%')
+          }
+          .alignItems(HorizontalAlign.Start)
+          .width('100%')
+        }
+        .constraintSize({ maxHeight: 240 })
+        .scrollBar(BarState.Off)
+        .width('100%')
+
+        Row({ space: 12 }) {
+          Text('不同意')
+            .fontSize(14)
+            .fontColor(Theme.secondary)
+            .textAlign(TextAlign.Center)
+            .height(42)
+            .layoutWeight(1)
+            .borderRadius(12)
+            .backgroundColor(Theme.cardRaised)
+            .onClick(() => this.declinePrivacy())
+          Text('同意并继续')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.onSelection)
+            .textAlign(TextAlign.Center)
+            .height(42)
+            .layoutWeight(1)
+            .borderRadius(12)
+            .backgroundColor(Theme.accent)
+            .onClick(() => this.agreePrivacy())
+        }
+        .width('100%')
+      }
+      .padding(20)
+      .width('86%')
+      .backgroundColor(Theme.card)
+      .borderRadius(18)
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor('#CC000000')
   }
 
   async initAssets(): Promise<void> {
@@ -2806,6 +3027,7 @@ struct Index {
           this.lang = this.lang === 'zh' ? 'en' : 'zh';
         })
       Text(this.drawerOpen ? '▾' : '▴')
+        .visibility(this.isWide() ? Visibility.None : Visibility.Visible)
         .fontSize(11)
         .fontColor(Theme.secondary)
         .padding({ left: 8, right: 4, top: 5, bottom: 5 })
@@ -3540,7 +3762,7 @@ struct Index {
       .scrollable(ScrollDirection.Vertical)
       .scrollBar(BarState.Off)
       .width('100%')
-      .height(238)
+      .height(this.panelScrollH())
       }
 
       if (this.drawerTab === 3) {
@@ -4613,7 +4835,7 @@ struct Index {
       .scrollable(ScrollDirection.Vertical)
       .scrollBar(BarState.Off)
       .width('100%')
-      .height(238)
+      .height(this.panelScrollH())
       }
 
       if (this.hasPhoto) {
@@ -4869,6 +5091,20 @@ struct Index {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      Row() {
+        if (this.isWide()) {
+          // lg / xl：控制面板常驻左侧栏，画布在右，避免平板、2in1 横屏大片留白。
+          Column() {
+            this.drawer()
+          }
+          .width(this.sideW())
+          .height('100%')
+          .backgroundColor(Theme.ground)
+          .border({ width: { right: 1 }, color: Theme.rule })
+          .onAreaChange((_old: Area, area: Area) => {
+            this.sideH = Number(area.height);
+          })
+        }
       Column() {
         this.topBar()
 
@@ -4880,6 +5116,10 @@ struct Index {
             .height('100%')
             .scale({ x: this.zoomK, y: this.zoomK })
             .translate({ x: this.panX + this.cropDx, y: this.panY + this.cropDy })
+            .onMouse((e: MouseEvent) => {
+              this.hoverX = e.x;
+              this.hoverY = e.y;
+            })
             .gesture(
               GestureGroup(GestureMode.Parallel,
                 PinchGesture({ fingers: 2 })
@@ -4967,6 +5207,12 @@ struct Index {
                   }),
                 PanGesture({ fingers: 1 })
                   .onActionStart((e: GestureEvent) => {
+                    // 2in1 上滚轮也会触发这条 PanGesture：只做缩放，不能进入拖画幅/拖灯。
+                    this.wheelOn = this.isWheel(e);
+                    if (this.wheelOn) {
+                      this.lightDragOn = false;
+                      return;
+                    }
                     this.basePanX = this.panX;
                     this.basePanY = this.panY;
                     this.cropBaseX = this.cropX;
@@ -5037,6 +5283,10 @@ struct Index {
                     }
                   })
                   .onActionUpdate((e: GestureEvent) => {
+                    if (this.wheelOn) {
+                      this.wheelZoom(e.axisVertical !== undefined ? e.axisVertical : 0);
+                      return;
+                    }
                     if (this.zoomK > 1.0) {
                       this.panX = this.basePanX + e.offsetX;
                       this.panY = this.basePanY + e.offsetY;
@@ -5062,6 +5312,10 @@ struct Index {
                     }
                   })
                   .onActionEnd(() => {
+                    if (this.wheelOn) {
+                      this.wheelOn = false;
+                      return;
+                    }
                     if (this.zoomK <= 1.0 && this.effAspect() > 0.0 &&
                       (this.cropDx !== 0 || this.cropDy !== 0)) {
                       const sh: number[] = this.cropShiftPx();
@@ -5139,12 +5393,17 @@ struct Index {
         this.viewH = Number(area.height);
       })
 
-        if (this.drawerOpen) {
+        if (!this.isWide() && this.drawerOpen) {
           this.drawer()
         }
       }
+      .layoutWeight(1)
+      .height('100%')
+      .backgroundColor(Theme.ground)
+      }
       .width('100%')
       .height('100%')
+      .padding({ top: this.safeTop, bottom: this.safeBottom })
       .backgroundColor(Theme.ground)
 
       if (this.pickMode > 0) {
@@ -5156,6 +5415,10 @@ struct Index {
             this.pickMode = 0;
           })
         this.pickerSheet()
+      }
+
+      if (this.privacyPending) {
+        this.privacyGate()
       }
     }
     .width('100%')

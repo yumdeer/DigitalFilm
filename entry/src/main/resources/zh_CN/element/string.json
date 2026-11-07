@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "模块描述"
+      "value": "DigitalFilm 胶片模拟"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "DigitalFilm 胶片模拟"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "DigitalFilm"
     },
     {
       "name": "EntryFormAbility_desc",
