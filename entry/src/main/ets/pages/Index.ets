@@ -5,7 +5,7 @@ import { fileUri } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { resourceManager } from '@kit.LocalizationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { colorSpaceManager } from '@kit.ArkGraphics2D';
+import { colorSpaceManager, drawing } from '@kit.ArkGraphics2D';
 import { promptAction, window } from '@kit.ArkUI';
 import {
   loadManifest, loadFilm, loadPaper, renderPixels, centerWeightedEv, meterEv,
@@ -16,7 +16,8 @@ import { Theme } from '../common/Theme';
 import { addGrain, addHalationGlare, addScatter, addVignette, adjustTone, addFilmEdge,
   composeFilmEdge, composeMediumEdge, EdgeResult,
   addDateBack, convertP3ToSrgb, applyColorLut, applyLightLayer } from '../engine/PostProcess';
-import { postTask, PostPayload, PostResult } from '../engine/PostTask';
+import { postTask, gradeTask, finishTask, GradeResult, PostPayload, PostResult, PostLight,
+  PostLut } from '../engine/PostTask';
 import { taskpool } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { renderSlice, SlicePayload } from '../engine/RenderTask';
@@ -116,6 +117,8 @@ interface LightTexture {
   data: Uint8Array;
   w: number;
   h: number;
+  /** Per-sprite gain: the ported sprites differ a lot in average energy. */
+  gain: number;
 }
 
 /** One light preset ported from the reference app's light_effect library. */
@@ -127,15 +130,66 @@ interface LightPreset {
   scale: number;
   /** Default layer opacity in percent. */
   strength: number;
+  /** Energy compensation so every stock reads at the same strength. */
+  gain: number;
 }
 
 const LIGHT_PRESETS: LightPreset[] = [
-  { id: 'shanyin', zh: '山阴', en: 'SHADE', scale: 45, strength: 60 },
-  { id: 'linear', zh: '线性逆光', en: 'BACKLIGHT', scale: 45, strength: 60 },
-  { id: 'holga', zh: 'Holga', en: 'HOLGA', scale: 30, strength: 60 },
-  { id: 'cuican', zh: '璀璨', en: 'GLOW', scale: 30, strength: 60 },
-  { id: 'sunburn', zh: 'Sunburn', en: 'SUNBURN', scale: 23, strength: 60 }
+  { id: 'shanyin', zh: '山阴', en: 'SHADE', scale: 45, strength: 30, gain: 3.6 },
+  { id: 'linear', zh: '线性逆光', en: 'BACKLIGHT', scale: 45, strength: 30, gain: 2.4 },
+  { id: 'holga', zh: '漏光', en: 'LIGHT LEAK', scale: 30, strength: 30, gain: 1.8 },
+  { id: 'cuican', zh: '璀璨', en: 'GLOW', scale: 30, strength: 30, gain: 1.3 },
+  { id: 'sunburn', zh: 'Sunburn', en: 'SUNBURN', scale: 23, strength: 30, gain: 1.0 }
 ];
+
+/**
+ * One saved light layer. The panel always edits a single light (the state
+ * above); 选下一盏时会自动入栈，所以可以一路叠加下去，不需要手动保存。
+ */
+interface FilmLayer {
+  id: number;
+  /** Index into films. */
+  film: number;
+  /** Index into papers（正片时忽略）. */
+  paper: number;
+}
+
+interface LightLayer {
+  id: number;
+  /** 1..5 index into LIGHT_PRESETS. */
+  preset: number;
+  strength: number;
+  scale: number;
+  x: number;
+  y: number;
+  /** 顺时针旋转角度（度）。 */
+  rot: number;
+  flipH: boolean;
+  flipV: boolean;
+}
+
+/** One saved built-in filter layer; layers are graded in list order. */
+interface LutLayer {
+  id: number;
+  /** Index into filters. */
+  index: number;
+  /** Percentage of the table's own default mix. */
+  strength: number;
+}
+
+/** 叠加栈里一层的类型；面板、保存按钮与列表都按 kind 复用同一套 UI。 */
+const LAYER_FILM: number = 0;
+const LAYER_LIGHT: number = 1;
+const LAYER_LUT: number = 2;
+
+/** 叠加列表的一行（各 kind 归一化后的展示数据）。 */
+interface LayerRow {
+  key: string;
+  id: number;
+  kind: number;
+  title: string;
+  detail: string;
+}
 
 /** Decoded film-border artwork (RGBA) for the selected stock. */
 interface EdgeTexture {
@@ -208,6 +262,85 @@ interface FilterSnap {
   lightScale: number;
   lightX: number;
   lightY: number;
+  lightRot: number;
+  lightFlipH: boolean;
+  lightFlipV: boolean;
+  lightLayers: LightLayer[];
+  filmLayers: FilmLayer[];
+  lutLayers: LutLayer[];
+  lightDraft: boolean;
+  filmDraft: boolean;
+  lutDraft: boolean;
+}
+
+/**
+ * The drag ring lives in its own component: the frame position is written on
+ * every pointer move, and keeping that write inside this scope is what makes
+ * the drag follow the finger instead of re-laying out the whole drawer.
+ */
+@Observed
+class LightDragState {
+  x: number = 0;
+  y: number = 0;
+  w: number = 0;
+  h: number = 0;
+  src: string = '';
+  alpha: number = 0.6;
+  gain: number = 1;
+  rot: number = 0;
+  flipH: boolean = false;
+  flipV: boolean = false;
+}
+
+/** 灯光叠加预览的增益滤镜：等价于 applyLightLayer 里的「贴图值 × gain」。 */
+const IDENTITY_CF: drawing.ColorFilter =
+  drawing.ColorFilter.createMatrixColorFilter([1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0]);
+const LIGHT_GAIN_CF: Map<number, drawing.ColorFilter> = new Map<number, drawing.ColorFilter>();
+function lightGainFilter(factor: number): drawing.ColorFilter {
+  const key: number = Math.round(factor * 1000);
+  const hit: drawing.ColorFilter | undefined = LIGHT_GAIN_CF.get(key);
+  if (hit !== undefined) {
+    return hit;
+  }
+  let cf: drawing.ColorFilter = IDENTITY_CF;
+  try {
+    cf = drawing.ColorFilter.createMatrixColorFilter(
+      [factor, 0, 0, 0, 0, 0, factor, 0, 0, 0, 0, 0, factor, 0, 0, 0, 0, 0, 1, 0]);
+    LIGHT_GAIN_CF.set(key, cf);
+  } catch (e) {
+  }
+  return cf;
+}
+
+@Component
+struct LightHandle {
+  @ObjectLink drag: LightDragState;
+
+  build() {
+    Stack({ alignContent: Alignment.Center }) {
+      // 拖动过程中用同一张灯光贴图做加法叠加，画面即时跟手；
+      // 灯光页签里松手后也不再跑像素链，直接由叠加层接管。
+      if (this.drag.src !== '' && this.drag.w > 0) {
+        Image($rawfile(this.drag.src))
+          .width(this.drag.w)
+          .height(this.drag.h)
+          .objectFit(ImageFit.Fill)
+          .blendMode(BlendMode.PLUS)
+          .colorFilter(lightGainFilter(this.drag.gain))
+          .opacity(this.drag.alpha)
+          .rotate({ angle: this.drag.rot })
+          .scale({ x: this.drag.flipH ? -1 : 1, y: this.drag.flipV ? -1 : 1 })
+          .hitTestBehavior(HitTestMode.None)
+      }
+      Column()
+        .width(26)
+        .height(26)
+        .borderRadius(13)
+        .border({ width: 1.5, color: Theme.accent })
+    }
+    .translate({ x: this.drag.x, y: this.drag.y })
+    .hitTestBehavior(HitTestMode.None)
+  }
 }
 
 @Entry
@@ -237,10 +370,26 @@ struct Index {
   @State vignette: number = 0;
   /** 0 = no light layer, 1..5 index into LIGHT_PRESETS. */
   @State lightIndex: number = 0;
-  @State lightStrength: number = 60;
+  @State lightStrength: number = 30;
   @State lightScale: number = 45;
   @State lightX: number = 0;
   @State lightY: number = 0;
+  /** 已保存的灯光图层；面板当前编辑的那盏光仍由上面的 lightIndex 等状态表示。 */
+  @State filmLayers: FilmLayer[] = [];
+  @State lightRot: number = 0;
+  @State lightFlipH: boolean = false;
+  @State lightFlipV: boolean = false;
+  @State lightLayers: LightLayer[] = [];
+  /** 已保存的内置滤镜图层，按列表顺序逐层上色。 */
+  @State lutLayers: LutLayer[] = [];
+  /**
+   * 面板里的这套参数是否参与渲染：保存后为 false，参数留在面板里方便继续微调，
+   * 但不再重复叠加；再次调整任何一项会重新置 true，成为下一层草稿。
+   */
+  @State filmDraft: boolean = false;
+  @State lightDraft: boolean = false;
+  @State lutDraft: boolean = false;
+  private layerSeq: number = 1;
   @State toneContrast: number = 0;
   @State toneSaturation: number = 0;
   @State toneBrightness: number = 0;
@@ -275,6 +424,8 @@ struct Index {
   @State lang: string = 'zh';
   /** 0 = the film pipeline (膠卷), 1 = the built-in colour filters. */
   @State filterTab: number = 0;
+  /** 场景分页：0 胶片 / 1 光学 / 2 构图 / 3 调色 / 4 输出。 */
+  @State drawerTab: number = 0;
   @State filters: FilterEntry[] = [];
   /** Index into filters, -1 means no table on top of the print. */
   @State lutIndex: number = -1;
@@ -295,27 +446,134 @@ struct Index {
     promptAction.showToast({ message: this.t(tipZh, tipEn), duration: 2600 });
   }
 
-  /** Mix the selected table at the strength its own app shipped with. */
-  private lutMix(): number {
-    if (this.filtersOff || this.filterTab !== 1 || this.lutIndex < 0 || this.lutIndex >= this.filters.length) {
-      return 0.0;
+  /** Deep copies keep undo snapshots independent of the live layer lists. */
+  private cloneLights(src: LightLayer[]): LightLayer[] {
+    const out: LightLayer[] = [];
+    for (let i = 0; i < src.length; i++) {
+      const l: LightLayer = src[i];
+      out.push({ id: l.id, preset: l.preset, strength: l.strength,
+        scale: l.scale, x: l.x, y: l.y,
+        rot: l.rot, flipH: l.flipH, flipV: l.flipV });
     }
-    return this.filters[this.lutIndex].strength * this.lutStrength / 100.0;
+    return out;
   }
 
-  /** Only the main-thread fallback uses this; a miss just skips the table. */
-  private cachedLut(): Uint8Array | undefined {
-    if (this.filtersOff || this.filterTab !== 1 || this.lutIndex < 0 || this.lutIndex >= this.filters.length) {
-      return undefined;
+  private cloneLuts(src: LutLayer[]): LutLayer[] {
+    const out: LutLayer[] = [];
+    for (let i = 0; i < src.length; i++) {
+      const l: LutLayer = src[i];
+      out.push({ id: l.id, index: l.index, strength: l.strength });
     }
-    return this.lutCache.get(this.filters[this.lutIndex].lut);
+    return out;
   }
 
-  private async currentLut(): Promise<Uint8Array> {
-    if (this.filtersOff || this.filterTab !== 1 || this.lutIndex < 0 || this.lutIndex >= this.filters.length) {
+  /** 手指落点到某盏灯中心的平方距离（像素）。 */
+  private lightDist2(px: number, py: number, lx: number, ly: number, iw: number,
+    ih: number): number {
+    const dx: number = px - lx / 100.0 * iw;
+    const dy: number = py - ly / 100.0 * ih;
+    return dx * dx + dy * dy;
+  }
+
+  private cloneFilms(src: FilmLayer[]): FilmLayer[] {
+    const out: FilmLayer[] = [];
+    for (let i = 0; i < src.length; i++) {
+      const l: FilmLayer = src[i];
+      out.push({ id: l.id, film: l.film, paper: l.paper });
+    }
+    return out;
+  }
+
+  /** 已叠加的胶片层 + 面板当前这一套，按叠加顺序展开。 */
+  private allFilmPairs(): FilmLayer[] {
+    const out: FilmLayer[] = this.cloneFilms(this.filmLayers);
+    if (this.filmDraft && !this.filtersOff && this.filmIndex >= 0 &&
+      this.filmIndex < this.films.length) {
+      out.push({ id: -1, film: this.filmIndex, paper: this.paperIndex });
+    }
+    return out;
+  }
+
+  /** 自动叠加：切换胶片前把面板这一套并入叠加栈，用户不需要点保存。 */
+  private commitFilmDraft(): void {
+    if (!this.filmDraft || this.filmIndex < 0 || this.filmIndex >= this.films.length) {
+      return;
+    }
+    this.filmLayers.push({ id: this.layerSeq++, film: this.filmIndex, paper: this.paperIndex });
+    this.filmDraft = false;
+  }
+
+  /** 选一款胶片只是准备下一层草稿，真正入栈由保存按钮确认。 */
+  private selectFilm(index: number): void {
+    if (index === this.filmIndex && this.filmDraft) {
+      return;
+    }
+    this.pushUndo();
+    this.leaveOriginal();
+    this.commitFilmDraft();
+    this.filmIndex = index;
+    this.filmDraft = true;
+    this.pickMode = 0;
+    this.renderPreview();
+  }
+
+  private removeFilmLayer(id: number): void {
+    this.pushUndo();
+    this.filmLayers = this.filmLayers.filter((l: FilmLayer) => l.id !== id);
+    this.renderPreview();
+  }
+
+  private editFilmLayer(id: number): void {
+    const hit: FilmLayer | undefined = this.filmLayers.find((l: FilmLayer) => l.id === id);
+    if (hit === undefined) {
+      return;
+    }
+    this.pushUndo();
+    this.leaveOriginal();
+    this.filmIndex = hit.film;
+    this.paperIndex = hit.paper;
+    this.filmLayers = this.filmLayers.filter((l: FilmLayer) => l.id !== id);
+    this.filmDraft = true;
+    this.renderPreview();
+  }
+
+  private filmPairName(l: FilmLayer): string {
+    const f: FilmAssets | undefined = this.films[l.film];
+    const p: PaperAssets | undefined = this.papers[l.paper];
+    if (f === undefined) {
+      return '';
+    }
+    return f.type === 'positive' || p === undefined ? f.name : f.name + ' × ' + p.name;
+  }
+
+  /** 已保存的灯光图层 + 面板当前这盏光，按叠加顺序展开。 */
+  private allLights(): LightLayer[] {
+    const out: LightLayer[] = this.cloneLights(this.lightLayers);
+    if (this.lightDraft && !this.filtersOff && this.lightIndex > 0 &&
+      this.lightStrength > 0) {
+      out.push({ id: -1, preset: this.lightIndex, strength: this.lightStrength,
+        scale: this.lightScale, x: this.lightX, y: this.lightY,
+        rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV });
+    }
+    return out;
+  }
+
+  /** 已保存的滤镜图层 + 面板当前这款，逐层串联上色。 */
+  private allLuts(): LutLayer[] {
+    const out: LutLayer[] = this.cloneLuts(this.lutLayers);
+    if (this.lutDraft && !this.filtersOff && this.filterTab === 1 && this.lutIndex >= 0 &&
+      this.lutIndex < this.filters.length && this.lutStrength > 0) {
+      out.push({ id: -1, index: this.lutIndex, strength: this.lutStrength });
+    }
+    return out;
+  }
+
+  /** Table bytes for one filter, loaded lazily and cached. */
+  private async lutBytes(index: number): Promise<Uint8Array> {
+    if (index < 0 || index >= this.filters.length) {
       return new Uint8Array(0);
     }
-    const f: FilterEntry = this.filters[this.lutIndex];
+    const f: FilterEntry = this.filters[index];
     let bytes: Uint8Array | undefined = this.lutCache.get(f.lut);
     if (bytes === undefined && this.rm !== undefined) {
       bytes = await loadFilterLut(this.rm, f.lut);
@@ -360,16 +618,25 @@ struct Index {
     if (this.filtersOff) {
       return this.t('原图', 'ORIGINAL');
     }
+    let name: string = '';
     if (this.filterTab === 1 && !this.stackFilm) {
-      if (this.lutIndex < 0 || this.lutIndex >= this.filters.length) {
-        return this.t('原味', 'ORIGINAL');
+      if (this.lutIndex >= 0 && this.lutIndex < this.filters.length) {
+        const f: FilterEntry = this.filters[this.lutIndex];
+        name = this.t(f.name, f.nameEn);
       }
-      const f: FilterEntry = this.filters[this.lutIndex];
-      return this.t(f.name, f.nameEn);
+    } else {
+      const film: FilmAssets | undefined = this.currentFilm();
+      const paper: PaperAssets | undefined = this.currentPaper();
+      name = film !== undefined && paper !== undefined ? film.name + ' × ' + paper.name : '';
     }
-    const film: FilmAssets | undefined = this.currentFilm();
-    const paper: PaperAssets | undefined = this.currentPaper();
-    return film !== undefined && paper !== undefined ? film.name + ' × ' + paper.name : '';
+    // 叠加图层数量写进状态行：清空面板选择后画面仍有滤镜/灯光时不会被误读成原图。
+    const layers: number = this.allLights().length + this.allLuts().length +
+      this.filmLayers.length;
+    if (layers > 0) {
+      const tag: string = layers + this.t(' 层', ' LAYERS');
+      name = name === '' ? tag : name + ' · ' + tag;
+    }
+    return name;
   }
 
   private snap(): FilterSnap {
@@ -384,6 +651,11 @@ struct Index {
       filmEdge: this.filmEdge, dateBack: this.dateBack,
       lightIndex: this.lightIndex, lightStrength: this.lightStrength,
       lightScale: this.lightScale, lightX: this.lightX, lightY: this.lightY,
+      lightRot: this.lightRot, lightFlipH: this.lightFlipH, lightFlipV: this.lightFlipV,
+      lightLayers: this.cloneLights(this.lightLayers),
+      filmLayers: this.cloneFilms(this.filmLayers),
+      lutLayers: this.cloneLuts(this.lutLayers),
+      lightDraft: this.lightDraft, filmDraft: this.filmDraft, lutDraft: this.lutDraft,
       rotation: this.rotation, flipH: this.flipH, flipV: this.flipV,
       lensCorrection: this.lensCorrection, straighten: this.straighten,
       aspect: this.aspect, aspectId: this.aspectId,
@@ -420,6 +692,15 @@ struct Index {
     this.lightScale = s.lightScale;
     this.lightX = s.lightX;
     this.lightY = s.lightY;
+    this.lightRot = s.lightRot;
+    this.lightFlipH = s.lightFlipH;
+    this.lightFlipV = s.lightFlipV;
+    this.lightLayers = this.cloneLights(s.lightLayers);
+    this.filmLayers = this.cloneFilms(s.filmLayers);
+    this.lutLayers = this.cloneLuts(s.lutLayers);
+    this.lightDraft = s.lightDraft;
+    this.filmDraft = s.filmDraft;
+    this.lutDraft = s.lutDraft;
     this.toneContrast = s.toneContrast;
     this.toneSaturation = s.toneSaturation;
     this.toneBrightness = s.toneBrightness;
@@ -455,6 +736,15 @@ struct Index {
     this.scatter = 0;
     this.vignette = 0;
     this.lightIndex = 0;
+    this.lightRot = 0;
+    this.lightFlipH = false;
+    this.lightFlipV = false;
+    this.lightLayers = [];
+    this.lutLayers = [];
+    this.filmLayers = [];
+    this.lightDraft = false;
+    this.lutDraft = false;
+    this.filmDraft = false;
     this.toneContrast = 0;
     this.toneSaturation = 0;
     this.toneBrightness = 0;
@@ -484,11 +774,525 @@ struct Index {
     }
   }
 
+  /** 选一款内置滤镜只是准备草稿，点保存才真正入栈。 */
   private selectLut(index: number): void {
+    if (index === this.lutIndex && this.lutDraft) {
+      return;
+    }
     this.pushUndo();
     this.leaveOriginal();
+    this.commitLutDraft();
     this.lutIndex = index;
+    this.lutDraft = index >= 0 && index < this.filters.length;
     this.renderPreview();
+  }
+
+  /** 自动叠加：切换内置滤镜前把面板这一款并入叠加栈。 */
+  private commitLutDraft(): void {
+    if (!this.lutDraft || this.lutIndex < 0 || this.lutIndex >= this.filters.length ||
+      this.lutStrength <= 0) {
+      return;
+    }
+    this.lutLayers.push({
+      id: this.layerSeq++, index: this.lutIndex, strength: this.lutStrength
+    });
+    this.lutDraft = false;
+  }
+
+  private presetName(preset: number): string {
+    if (preset <= 0 || preset > LIGHT_PRESETS.length) {
+      return '';
+    }
+    const p: LightPreset = LIGHT_PRESETS[preset - 1];
+    return this.t(p.zh, p.en);
+  }
+
+  private presetId(preset: number): string {
+    return preset > 0 && preset <= LIGHT_PRESETS.length ? LIGHT_PRESETS[preset - 1].id : '';
+  }
+
+  private presetGain(preset: number): number {
+    return preset > 0 && preset <= LIGHT_PRESETS.length ? LIGHT_PRESETS[preset - 1].gain : 1.0;
+  }
+
+  /**
+   * 灯光页签里灯光只作为 UI 叠加层实时预览，像素里不再烘焙：
+   * 拖动、增删、调强度都只是 GPU 合成，永远不用等 1~2 秒的像素链。
+   */
+  private lightLive(): boolean {
+    return !this.filtersOff && this.hasPhoto && !this.showOriginal && this.allLights().length > 0;
+  }
+
+  /** 灯光改动后的收尾：叠加模式下画面已经实时生效，不需要重跑像素链。 */
+  private afterLightEdit(): void {
+    if (this.lightLive()) {
+      this.lightDragOn = false;
+      return;
+    }
+    this.renderPreview();
+  }
+
+  /** 画布上的灯光叠加层；拖动中的那一盏交给 LightHandle 画，避免出现重影。 */
+  private overlayLights(): LightLayer[] {
+    const all: LightLayer[] = this.allLights();
+    if (!this.lightDragOn) {
+      return all;
+    }
+    const skip: number = this.lightDragType === 1 ? this.lightDragLayerId : -1;
+    return all.filter((l: LightLayer) => l.id !== skip);
+  }
+
+  /** 切换抽屉页签：灯光只存在于叠加层，像素层不需要重渲染。 */
+  private setDrawerTab(index: number): void {
+    if (this.drawerTab !== index) {
+      this.drawerTab = index;
+    }
+  }
+
+  /** 双指落点是否落在某一盏灯的范围内（判断捏合是缩灯还是缩图）。 */
+  private insideLight(tx: number, ty: number, x: number, y: number, scale: number,
+                      aw: number, ah: number): boolean {
+    const dw: number = aw * Math.max(0.01, scale / 100.0);
+    const dh: number = dw / (this.lightAspect > 0 ? this.lightAspect : 1.0);
+    return Math.abs(tx - x / 100.0 * aw) <= dw / 2.0 &&
+      Math.abs(ty - y / 100.0 * ah) <= dh / 2.0;
+  }
+
+  /** 双指缩放时改写某一盏已存灯光的尺寸。 */
+  private setLayerScale(id: number, scale: number): void {
+    this.lightLayers = this.lightLayers.map((l: LightLayer) => l.id === id
+      ? { id: l.id, preset: l.preset, strength: l.strength, scale: scale, x: l.x, y: l.y,
+        rot: l.rot, flipH: l.flipH, flipV: l.flipV } as LightLayer
+      : l);
+  }
+
+  /** 选一盏灯只是准备草稿，点保存才真正入栈，不是互斥单选。 */
+  private selectLight(index: number): void {
+    if (index === this.lightIndex && index > 0 && this.lightDraft) {
+      return;
+    }
+    if (index <= 0) {
+      // 「无」= 丢弃面板里这盏还没入栈的灯，画面必须立刻回到没有它的状态；
+      // 以前这里会先 commitLightDraft() 把它存进叠加栈，点「无」反而留下灯光。
+      if (!this.lightDraft && this.lightIndex === 0) {
+        return;
+      }
+      this.pushUndo();
+      this.lightDraft = false;
+      this.lightIndex = 0;
+      this.lightRot = 0;
+      this.lightFlipH = false;
+      this.lightFlipV = false;
+      this.afterLightEdit();
+      return;
+    }
+    const wasOff: boolean = this.filtersOff;
+    this.pushUndo();
+    this.leaveOriginal();
+    this.commitLightDraft();
+    this.lightIndex = index;
+    this.lightDraft = index > 0;
+    if (index > 0) {
+      const p: LightPreset = LIGHT_PRESETS[index - 1];
+      this.lightStrength = p.strength;
+      this.lightScale = p.scale;
+      this.lightX = 0;
+      this.lightY = 0;
+      this.lightRot = 0;
+      this.lightFlipH = false;
+      this.lightFlipV = false;
+    }
+    if (wasOff) {
+      this.renderPreview();
+    } else {
+      this.afterLightEdit();
+    }
+  }
+
+  /** 自动叠加：切换灯光前把面板这一盏并入叠加栈。 */
+  private commitLightDraft(): void {
+    if (!this.lightDraft || this.lightIndex <= 0 || this.lightStrength <= 0) {
+      return;
+    }
+    this.lightLayers.push({
+      id: this.layerSeq++, preset: this.lightIndex, strength: this.lightStrength,
+      scale: this.lightScale, x: this.lightX, y: this.lightY,
+      rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV
+    });
+    this.lightDraft = false;
+  }
+
+  /** 画面上每个灯的外框：已入栈的灯和面板里这盏都会出现。 */
+  private frameLights(): LightLayer[] {
+    const out: LightLayer[] = [];
+    if (this.filtersOff) {
+      return out;
+    }
+    for (let i: number = 0; i < this.lightLayers.length; i++) {
+      out.push(this.lightLayers[i]);
+    }
+    if (this.lightDraft && this.lightIndex > 0 && this.lightStrength > 0) {
+      out.push({ id: -1, preset: this.lightIndex, strength: this.lightStrength,
+        scale: this.lightScale, x: this.lightX, y: this.lightY,
+        rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV });
+    }
+    return out;
+  }
+
+  private lightAreaW(): number {
+    const s: number = this.previewScale();
+    return (this.innerW > 0 ? this.innerW : this.previewW) * s;
+  }
+
+  private lightAreaH(): number {
+    const s: number = this.previewScale();
+    return (this.innerH > 0 ? this.innerH : this.previewH) * s;
+  }
+
+  /** 灯光外框宽度（显示像素）：和拖动预览用同一套换算。 */
+  private lightFrameW(l: LightLayer): number {
+    return Math.max(44, this.lightAreaW() * Math.max(0.01, l.scale / 100.0));
+  }
+
+  private lightFrameH(l: LightLayer): number {
+    const a: number = this.lightAspect > 0 ? this.lightAspect : 1.0;
+    return Math.max(44, this.lightFrameW(l) / a);
+  }
+
+  /** 角上按钮的横向偏移：外框超出画面时收回到画面内沿，保证按钮始终点得到。 */
+  private frameBtnDx(l: LightLayer): number {
+    const half: number = this.lightAreaW() / 2.0 - 14;
+    return Math.min(this.lightFrameW(l) / 2.0, Math.max(0, half));
+  }
+
+  /** 角上按钮的纵向偏移，规则同 frameBtnDx。 */
+  private frameBtnDy(l: LightLayer): number {
+    const half: number = this.lightAreaH() / 2.0 - 14;
+    return Math.min(this.lightFrameH(l) / 2.0, Math.max(0, half));
+  }
+
+  /** 外框上的 × ：删掉这盏灯（id<0 表示面板里还没入栈的草稿）。 */
+  private deleteLightAt(id: number): void {
+    if (id < 0) {
+      this.pushUndo();
+      this.lightDraft = false;
+      this.lightIndex = 0;
+      this.lightRot = 0;
+      this.lightFlipH = false;
+      this.lightFlipV = false;
+      this.afterLightEdit();
+      return;
+    }
+    this.removeLightLayer(id);
+  }
+
+  /** 外框上的旋转键：每次转 15°，直接写回对应的那盏灯。 */
+  private rotateLightAt(id: number): void {
+    this.pushUndo();
+    const next: number = (Math.round((id < 0 ? this.lightRot : this.layerRot(id)) / 15.0) + 1) * 15;
+    const angle: number = next >= 360 ? next - 360 : next;
+    if (id < 0) {
+      this.lightRot = angle;
+      this.afterLightEdit();
+      return;
+    }
+    const out: LightLayer[] = [];
+    for (let i: number = 0; i < this.lightLayers.length; i++) {
+      const l: LightLayer = this.lightLayers[i];
+      if (l.id === id) {
+        out.push({ id: l.id, preset: l.preset, strength: l.strength, scale: l.scale,
+          x: l.x, y: l.y, rot: angle, flipH: l.flipH, flipV: l.flipV });
+      } else {
+        out.push(l);
+      }
+    }
+    this.lightLayers = out;
+    this.afterLightEdit();
+  }
+
+  /** 外框旋转键：按住拖动实时转动预览，松手才写回并重渲染。 */
+  private beginRotateDrag(id: number): void {
+    if (this.lightRotDragId !== 999) {
+      return;
+    }
+    this.pushUndo();
+    this.lightRotDragBase = id < 0 ? this.lightRot : this.layerRot(id);
+    this.lightRotDragAngle = this.lightRotDragBase;
+    this.lightRotDragId = id;
+  }
+
+  /** 以灯位中心为圆心，按手指相对旋转键转过的角度算出新角度。 */
+  private updateRotateDrag(l: LightLayer, dx: number, dy: number): void {
+    const hw: number = this.lightFrameW(l) / 2.0;
+    const hh: number = this.lightFrameH(l) / 2.0;
+    const rad: number = this.lightRotDragBase * Math.PI / 180.0;
+    const sx: number = hw * Math.cos(rad) - hh * Math.sin(rad);
+    const sy: number = hw * Math.sin(rad) + hh * Math.cos(rad);
+    const deg: number = Math.atan2(sy + dy, sx + dx) * 180.0 / Math.PI;
+    let angle: number = this.lightRotDragBase + (deg - 45.0);
+    while (angle > 180.0) {
+      angle -= 360.0;
+    }
+    while (angle <= -180.0) {
+      angle += 360.0;
+    }
+    this.lightRotDragAngle = Math.round(angle);
+  }
+
+  private endRotateDrag(): void {
+    if (this.lightRotDragId === 999) {
+      return;
+    }
+    const id: number = this.lightRotDragId;
+    const angle: number = Math.round(this.lightRotDragAngle);
+    this.lightRotDragId = 999;
+    if (id < 0) {
+      this.lightDraft = true;
+      this.lightRot = angle;
+    } else {
+      this.lightLayers = this.lightLayers.map((l: LightLayer) => l.id === id
+        ? { id: l.id, preset: l.preset, strength: l.strength, scale: l.scale,
+          x: l.x, y: l.y, rot: angle, flipH: l.flipH, flipV: l.flipV } as LightLayer
+        : l);
+    }
+    this.afterLightEdit();
+  }
+
+  /** 外框实时角度：拖动中读临时值，平时读图层自己的角度。 */
+  private frameRot(l: LightLayer): number {
+    return this.lightRotDragId === l.id ? this.lightRotDragAngle : l.rot;
+  }
+
+  private layerRot(id: number): number {
+    const hit: LightLayer | undefined = this.lightLayers.find((l: LightLayer) => l.id === id);
+    return hit === undefined ? 0 : hit.rot;
+  }
+
+  private removeLightLayer(id: number): void {
+    this.pushUndo();
+    this.lightLayers = this.lightLayers.filter((l: LightLayer) => l.id !== id);
+    this.afterLightEdit();
+  }
+
+  /** 把图层取回面板继续调整（取回后不再重复渲染两层）。 */
+  private editLightLayer(id: number): void {
+    const hit: LightLayer | undefined = this.lightLayers.find((l: LightLayer) => l.id === id);
+    if (hit === undefined) {
+      return;
+    }
+    this.pushUndo();
+    this.lightIndex = hit.preset;
+    this.lightStrength = hit.strength;
+    this.lightScale = hit.scale;
+    this.lightX = hit.x;
+    this.lightY = hit.y;
+    this.lightRot = hit.rot;
+    this.lightFlipH = hit.flipH;
+    this.lightFlipV = hit.flipV;
+    this.lightLayers = this.lightLayers.filter((l: LightLayer) => l.id !== id);
+    this.lightDraft = true;
+    this.afterLightEdit();
+  }
+
+  private removeLutLayer(id: number): void {
+    this.pushUndo();
+    this.lutLayers = this.lutLayers.filter((l: LutLayer) => l.id !== id);
+    this.renderPreview();
+  }
+
+  private editLutLayer(id: number): void {
+    const hit: LutLayer | undefined = this.lutLayers.find((l: LutLayer) => l.id === id);
+    if (hit === undefined) {
+      return;
+    }
+    this.pushUndo();
+    this.leaveOriginal();
+    this.lutIndex = hit.index;
+    this.lutStrength = hit.strength;
+    this.lutLayers = this.lutLayers.filter((l: LutLayer) => l.id !== id);
+    this.lutDraft = true;
+    this.renderPreview();
+  }
+
+  /** 把某一类叠加层归一化成列表行，供公共列表 UI 渲染。 */
+  private layerRows(kind: number): LayerRow[] {
+    const rows: LayerRow[] = [];
+    if (kind === LAYER_FILM) {
+      for (let i: number = 0; i < this.filmLayers.length; i++) {
+        const l: FilmLayer = this.filmLayers[i];
+        rows.push({ key: 'f' + l.id, id: l.id, kind: kind,
+          title: this.filmPairName(l), detail: '' });
+      }
+    } else if (kind === LAYER_LIGHT) {
+      for (let i: number = 0; i < this.lightLayers.length; i++) {
+        const l: LightLayer = this.lightLayers[i];
+        rows.push({ key: 'l' + l.id, id: l.id, kind: kind,
+          title: this.presetName(l.preset),
+          detail: Math.round(l.strength) + '%' +
+            (l.rot !== 0 ? ' · ' + Math.round(l.rot) + '°' : '') +
+            (l.flipH ? ' · H' : '') + (l.flipV ? ' · V' : '') });
+      }
+    } else {
+      for (let i: number = 0; i < this.lutLayers.length; i++) {
+        const l: LutLayer = this.lutLayers[i];
+        const f: FilterEntry | undefined = this.filters[l.index];
+        rows.push({ key: 't' + l.id, id: l.id, kind: kind,
+          title: f === undefined ? '' : this.t(f.name, f.nameEn),
+          detail: Math.round(l.strength) + '%' });
+      }
+    }
+    return rows;
+  }
+
+  private removeLayerByKind(kind: number, id: number): void {
+    if (id < 0) {
+      this.pushUndo();
+      if (kind === LAYER_FILM) {
+        this.filmDraft = false;
+      } else if (kind === LAYER_LIGHT) {
+        this.lightDraft = false;
+      } else {
+        this.lutDraft = false;
+      }
+      this.renderPreview();
+      return;
+    }
+    if (kind === LAYER_FILM) {
+      this.removeFilmLayer(id);
+    } else if (kind === LAYER_LIGHT) {
+      this.removeLightLayer(id);
+    } else {
+      this.removeLutLayer(id);
+    }
+  }
+
+  private editLayerByKind(kind: number, id: number): void {
+    if (kind === LAYER_FILM) {
+      this.editFilmLayer(id);
+    } else if (kind === LAYER_LIGHT) {
+      this.editLightLayer(id);
+    } else {
+      this.editLutLayer(id);
+    }
+  }
+
+  /** 已保存层 + 面板里正在调整的那一层。 */
+  private totalLayers(): number {
+    let n: number = this.filmLayers.length + this.lightLayers.length + this.lutLayers.length;
+    if (this.filmDraft && this.filmIndex >= 0 && this.filmIndex < this.films.length) {
+      n++;
+    }
+    if (this.lightDraft && this.lightIndex > 0 && this.lightStrength > 0) {
+      n++;
+    }
+    if (this.lutDraft && this.lutIndex >= 0 && this.lutIndex < this.filters.length) {
+      n++;
+    }
+    return n;
+  }
+
+  private layerKindName(kind: number): string {
+    if (kind === LAYER_FILM) {
+      return this.t('胶片', 'FILM');
+    }
+    if (kind === LAYER_LIGHT) {
+      return this.t('灯光', 'LIGHT');
+    }
+    return this.t('滤镜', 'LUT');
+  }
+
+  /** 已保存图层 + 面板里正在调整的草稿，按应用顺序排好。 */
+  private allLayerRows(): LayerRow[] {
+    const rows: LayerRow[] = this.layerRows(LAYER_FILM)
+      .concat(this.layerRows(LAYER_LIGHT))
+      .concat(this.layerRows(LAYER_LUT));
+    if (this.filmDraft && this.filmIndex >= 0 && this.filmIndex < this.films.length) {
+      rows.push({ key: 'live-f', id: -1, kind: LAYER_FILM,
+        title: this.filmPairName({ id: -1, film: this.filmIndex, paper: this.paperIndex }),
+        detail: this.t('调整中', 'LIVE') });
+    }
+    if (this.lightDraft && this.lightIndex > 0 && this.lightStrength > 0) {
+      rows.push({ key: 'live-l', id: -1, kind: LAYER_LIGHT,
+        title: this.presetName(this.lightIndex), detail: this.t('调整中', 'LIVE') });
+    }
+    if (this.lutDraft && this.lutIndex >= 0 && this.lutIndex < this.filters.length) {
+      const lf: FilterEntry | undefined = this.filters[this.lutIndex];
+      rows.push({ key: 'live-t', id: -1, kind: LAYER_LUT,
+        title: lf === undefined ? '' : this.t(lf.name, lf.nameEn),
+        detail: this.t('调整中', 'LIVE') });
+    }
+    rows.sort((x: LayerRow, y: LayerRow) => x.id < 0 ? 1 : (y.id < 0 ? -1 : x.id - y.id));
+    return rows;
+  }
+
+  private editLayerFromStack(row: LayerRow): void {
+    if (row.kind === LAYER_FILM) {
+      this.setDrawerTab(0);
+      this.filterTab = 0;
+    } else if (row.kind === LAYER_LUT) {
+      this.setDrawerTab(0);
+      this.filterTab = 1;
+    } else {
+      this.setDrawerTab(5);
+    }
+    if (row.id >= 0) {
+      this.editLayerByKind(row.kind, row.id);
+    }
+  }
+
+  /** 「输出」页签：编辑期不设保存按钮，这里只读展示已实时生效的调整。 */
+  @Builder
+  appliedSummary() {
+    Row() {
+      this.headerLabel('已应用调整', 'APPLIED')
+      Blank()
+      Text(this.totalLayers() + this.t(' 层', ' LAYERS'))
+        .fontSize(9)
+        .fontColor(Theme.dim)
+    }
+    .width('100%')
+    .margin({ top: 12, bottom: 4 })
+
+    if (this.totalLayers() === 0) {
+      Text(this.t('还没有叠加效果，直接在滤镜 / 灯光页调整即可实时生效。',
+        'Nothing applied yet — tweak FILM or LIGHT and it takes effect live.'))
+        .fontSize(9)
+        .fontColor(Theme.dim)
+        .width('100%')
+    } else {
+      Column() {
+        ForEach(this.allLayerRows(), (row: LayerRow) => {
+          Row() {
+            Text(this.layerKindName(row.kind))
+              .fontSize(8)
+              .fontColor(Theme.dim)
+              .width(34)
+            Text(row.title)
+              .fontSize(9)
+              .fontColor(Theme.text)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            if (row.detail !== '') {
+              Text(row.detail)
+                .fontSize(8)
+                .fontColor(row.id < 0 ? Theme.accent : Theme.dim)
+                .margin({ left: 6 })
+            }
+            Text('×')
+              .fontSize(12)
+              .fontColor(Theme.secondary)
+              .padding({ left: 8, right: 2, top: 1, bottom: 1 })
+              .onClick(() => this.removeLayerByKind(row.kind, row.id))
+          }
+          .width('100%')
+          .height(24)
+          .alignItems(VerticalAlign.Center)
+          .onClick(() => this.editLayerFromStack(row))
+        }, (row: LayerRow) => row.key)
+      }
+      .width('100%')
+    }
   }
 
   @Builder
@@ -500,6 +1304,15 @@ struct Index {
       .onClick(() => this.hint(tipZh, tipEn))
   }
   @State hist: number[] = [];
+  /** 直方图卡片相对右上角默认位置的拖动偏移；双击卡片可归位。 */
+  @State histOffX: number = 0;
+  @State histOffY: number = 0;
+  /** 直方图开关：右上角卡片可以在顶栏关掉/重新打开。 */
+  @State showHist: boolean = true;
+  private histDragBaseX: number = 0;
+  private histDragBaseY: number = 0;
+  private histCardW: number = 116;
+  private histCardH: number = 84;
   @State zoomK: number = 1.0;
   @State panX: number = 0;
   @State panY: number = 0;
@@ -516,6 +1329,21 @@ struct Index {
   private previewW: number = 0;
   private previewH: number = 0;
   private previewEv: number = 0;
+  /** 预览几何结果缓存：改灯光/胶片参数时不再重复旋转裁剪。 */
+  private geoCacheKey: string = '';
+  private geoCacheBuf: Uint8Array | undefined = undefined;
+  private geoCacheW: number = 0;
+  private geoCacheH: number = 0;
+  /** 原图对比 PixelMap 只在几何变化时重建。 */
+  private originalKey: string = '';
+  /** 胶片模拟结果缓存：只改灯光时直接复用，跳过最慢的胶片渲染。 */
+  private filmCacheKey: string = '';
+  private filmCacheBuf: Uint8Array | undefined = undefined;
+  /** 调色链（光晕/散射/暗角/色调/LUT）结果缓存：改灯光时整段跳过。 */
+  private gradeCacheKey: string = '';
+  private gradeCacheBuf: Uint8Array | undefined = undefined;
+  /** 换照片时递增，避免新旧图片命中同一把缓存键。 */
+  private photoGen: number = 0;
   private fullSrc: Uint8Array | undefined = undefined;
   private fullW: number = 0;
   private fullH: number = 0;
@@ -523,12 +1351,30 @@ struct Index {
   private pendingRender: boolean = false;
   private histAcc: number[] = [];
   private baseZoom: number = 1.0;
+  /** 双指缩放灯光：0=面板草稿，1=已存图层。 */
+  private pinchLightOn: boolean = false;
+  private pinchLightType: number = 0;
+  private pinchLayerId: number = -1;
+  private pinchBaseScale: number = 45;
   private basePanX: number = 0;
+  /** 拖动目标：0 = 面板正在调的那盏，1 = 已存灯光图层。 */
+  private lightDragType: number = 0;
+  private lightDragLayerId: number = -1;
   private lightBaseX: number = 0;
   private lightBaseY: number = 0;
-  @State lightDragging: boolean = false;
-  @State lightDragX: number = 0;
-  @State lightDragY: number = 0;
+  @State lightDragOn: boolean = false;
+  @State lightDrag: LightDragState = new LightDragState();
+  /** 外框旋转键拖动中的那盏灯（-1 = 面板草稿，999 = 没在拖）。 */
+  @State lightRotDragId: number = 999;
+  @State lightRotDragAngle: number = 0;
+  private lightRotDragBase: number = 0;
+  private lightAspect: number = 1.0;
+  /** Committed on release; dragging never rewrites the light @State. */
+  private lightPendingX: number = 0;
+  private lightPendingY: number = 0;
+  /** Print area inside the frame decoration, in image pixels. */
+  private innerW: number = 0;
+  private innerH: number = 0;
   private basePanY: number = 0;
   private cropBaseX: number = 0.5;
   private cropBaseY: number = 0.5;
@@ -714,6 +1560,14 @@ struct Index {
       this.previewSrc = new Uint8Array(pbuf);
       this.previewW = aw;
       this.previewH = ah;
+      this.photoGen += 1;
+      this.geoCacheBuf = undefined;
+      this.geoCacheKey = '';
+      this.filmCacheBuf = undefined;
+      this.filmCacheKey = '';
+      this.gradeCacheBuf = undefined;
+      this.gradeCacheKey = '';
+      this.originalKey = '';
 
       const fullLong: number = 3000;
       const fs2: number = Math.min(1.0, fullLong / Math.max(ow, oh));
@@ -752,12 +1606,23 @@ struct Index {
       this.cropDx = 0;
       this.cropDy = 0;
       this.hasPhoto = true;
+      // 新照片先按「原图」显示：胶卷/相纸属于创作选择，必须由用户主动挑选后才应用。
+      this.filtersOff = true;
       this.busy = false;
       await this.renderPreview();
     } catch (e) {
       this.busy = false;
       this.failPhoto(e);
     }
+  }
+
+  /** 「原图」状态下不显示胶卷/相纸的选中态：那是待应用的选择，不是当前效果。 */
+  private filmSel(i: number): boolean {
+    return i === this.filmIndex && !this.filtersOff;
+  }
+
+  private paperSel(i: number): boolean {
+    return i === this.paperIndex && !this.filtersOff && !this.isPositiveFilm();
   }
 
   currentFilm(): FilmAssets | undefined {
@@ -820,9 +1685,12 @@ struct Index {
   }
 
   /** Render the whole frame on the task pool; falls back to the main thread. */
-  private async renderFull(src: Uint8Array, w: number, h: number, ev: number): Promise<Uint8Array> {
-    const film: FilmAssets = this.currentFilm() as FilmAssets;
-    const paper: PaperAssets = this.currentPaper() as PaperAssets;
+  private async renderFull(src: Uint8Array, w: number, h: number, ev: number,
+                           pair: FilmLayer): Promise<Uint8Array> {
+    const film: FilmAssets = this.films[pair.film];
+    const paper: PaperAssets = film.type === 'positive'
+      ? (this.paperCache.get('scan_' + film.id) as PaperAssets)
+      : this.papers[pair.paper];
     const positive: boolean = film.type === 'positive';
     const out: Uint8Array = new Uint8Array(w * h * 4);
     // Each slice carries a private copy of the film and print tables, so
@@ -830,7 +1698,7 @@ struct Index {
     // saturate the worker threads without that memory spike.
     const slices: number = Math.max(3, Math.min(12, Math.round(h / 160)));
     const rowsPer: number = Math.ceil(h / slices);
-    const seed: number = this.filmIndex * 97 + this.paperIndex * 31 + Math.round(ev * 10);
+    const seed: number = pair.film * 97 + pair.paper * 31 + Math.round(ev * 10);
     const tasks: Promise<Object>[] = [];
     try {
       for (let s = 0; s < slices; s++) {
@@ -986,12 +1854,11 @@ struct Index {
    * Light sprites are opaque black-background light maps from the reference
    * app, so they only need a screen blend; the cache mirrors the edge artwork.
    */
-  private async ensureLightTexture(): Promise<LightTexture | null> {
-    if (this.lightIndex <= 0 || this.filtersOff || this.lightStrength <= 0 ||
-      this.rm === undefined) {
+  private async ensureLightTexture(presetIndex: number): Promise<LightTexture | null> {
+    if (presetIndex <= 0 || presetIndex > LIGHT_PRESETS.length || this.rm === undefined) {
       return null;
     }
-    const preset: LightPreset = LIGHT_PRESETS[this.lightIndex - 1];
+    const preset: LightPreset = LIGHT_PRESETS[presetIndex - 1];
     const cached: LightTexture | undefined = this.lightTexCache.get(preset.id);
     if (cached !== undefined) {
       return cached;
@@ -1008,8 +1875,12 @@ struct Index {
       const data: Uint8Array =
         new Uint8Array(info.size.width * info.size.height * 4);
       await pm.readPixelsToBuffer(data.buffer as ArrayBuffer);
-      const tex: LightTexture = { data: data, w: info.size.width, h: info.size.height };
-      if (this.lightTexCache.size >= 2) {
+      this.lightAspect = info.size.height > 0 ? info.size.width / info.size.height : 1.0;
+      const tex: LightTexture = {
+        data: data, w: info.size.width, h: info.size.height, gain: preset.gain
+      };
+      // 多层灯光会同时用到多张贴图，缓存按预设总数保留。
+      if (this.lightTexCache.size >= LIGHT_PRESETS.length) {
         this.lightTexCache.clear();
       }
       this.lightTexCache.set(preset.id, tex);
@@ -1022,7 +1893,7 @@ struct Index {
   }
 
   private applyPost(pixels: Uint8Array, w: number, h: number,
-                    tex: EdgeTexture | null, light: LightTexture | null): PostResult {
+                    tex: EdgeTexture | null, lights: PostLight[]): PostResult {
     if (this.filtersOff) {
       return { pixels: pixels, w: w, h: h, stageMs: 'original' };
     }
@@ -1032,15 +1903,23 @@ struct Index {
     adjustTone(pixels, w, h, this.toneContrast, this.toneSaturation, this.toneBrightness,
       this.toneHighlights, this.toneShadows);
     convertP3ToSrgb(pixels, w, h);
-    const lut: Uint8Array | undefined = this.cachedLut();
-    if (lut !== undefined) {
-      applyColorLut(pixels, w, h, lut, this.lutMix());
+    // 内置滤镜按保存顺序串联，面板里正在编辑的那一款排最后。
+    const luts: LutLayer[] = this.allLuts();
+    for (let i = 0; i < luts.length; i++) {
+      const f: FilterEntry | undefined = this.filters[luts[i].index];
+      if (f === undefined) {
+        continue;
+      }
+      const table: Uint8Array | undefined = this.lutCache.get(f.lut);
+      if (table !== undefined) {
+        applyColorLut(pixels, w, h, table, f.strength * luts[i].strength / 100.0);
+      }
     }
-    // The light sits on the print, before the decorative frame is composited.
-    if (light !== null && this.lightStrength > 0) {
-      applyLightLayer(pixels, w, h, light.data, light.w, light.h,
-        this.lightStrength / 100.0, Math.max(0.01, this.lightScale / 100.0),
-        this.lightX / 100.0, this.lightY / 100.0);
+    // 灯光同样可叠加：已保存的图层 + 面板当前这盏，全部做加法叠加。
+    for (let i = 0; i < lights.length; i++) {
+      const L: PostLight = lights[i];
+      applyLightLayer(pixels, w, h, L.tex, L.w, L.h, L.opacity, L.scale,
+        L.offX, L.offY, L.gain);
     }
     let edge: EdgeResult;
     if (tex === null) {
@@ -1104,14 +1983,42 @@ struct Index {
     }
   }
 
-  /** The whole post chain as one task-pool job; returns the processed buffer. */
-  private async applyPostAsync(pixels: Uint8Array, w: number, h: number,
-                               tex: EdgeTexture | null): Promise<PostResult> {
-    // 「原图」跳过整条后期链：没有眩光/散射/暗角/色调/LUT/片边/日期。
-    if (this.filtersOff) {
-      return { pixels: pixels, w: w, h: h, stageMs: 'original' };
+  /** 组装后期参数：贴图先切片，避免 taskpool 转移掉缓存本体。 */
+  private async buildPostPayload(pixels: Uint8Array, w: number, h: number,
+                                 tex: EdgeTexture | null,
+                                 withLights: boolean = true): Promise<PostPayload> {
+    const luts: PostLut[] = [];
+    const savedLuts: LutLayer[] = this.allLuts();
+    for (let i = 0; i < savedLuts.length; i++) {
+      const entry: LutLayer = savedLuts[i];
+      if (entry.index < 0 || entry.index >= this.filters.length) {
+        continue;
+      }
+      const table: Uint8Array = await this.lutBytes(entry.index);
+      if (table.length === 0) {
+        continue;
+      }
+      luts.push({
+        table: table,
+        strength: this.filters[entry.index].strength * entry.strength / 100.0
+      });
     }
-    const light: LightTexture | null = await this.ensureLightTexture();
+    const lights: PostLight[] = [];
+    const savedLights: LightLayer[] = withLights ? this.allLights() : [];
+    for (let i = 0; i < savedLights.length; i++) {
+      const entry: LightLayer = savedLights[i];
+      const lt: LightTexture | null = await this.ensureLightTexture(entry.preset);
+      if (lt === null) {
+        continue;
+      }
+      lights.push({
+        tex: lt.data.slice(), w: lt.w, h: lt.h,
+        opacity: entry.strength / 100.0,
+        scale: Math.max(0.01, entry.scale / 100.0),
+        offX: entry.x / 100.0, offY: entry.y / 100.0, gain: lt.gain,
+        rot: entry.rot, flipH: entry.flipH, flipV: entry.flipV
+      });
+    }
     const payload: PostPayload = {
       pixels: pixels, w: w, h: h,
       halation: this.halation / 100.0, glare: this.glare / 30.0,
@@ -1125,21 +2032,101 @@ struct Index {
       edgePpm: tex !== null ? tex.ppm : 0,
       edgeRotate: h > w,
       dateBack: this.dateBack, dateText: this.dateStamp(),
-      lut: await this.currentLut(), lutStrength: this.lutMix(),
-      lightTex: light !== null ? light.data.slice() : undefined,
-      lightW: light !== null ? light.w : 0,
-      lightH: light !== null ? light.h : 0,
-      lightOpacity: this.lightStrength / 100.0,
-      lightScale: Math.max(0.01, this.lightScale / 100.0),
-      lightOffX: this.lightX / 100.0,
-      lightOffY: this.lightY / 100.0
+      luts: luts, lights: lights
     };
+    return payload;
+  }
+
+  /** The whole post chain as one task-pool job; returns the processed buffer. */
+  private async applyPostAsync(pixels: Uint8Array, w: number, h: number,
+                               tex: EdgeTexture | null): Promise<PostResult> {
+    // 「原图」跳过整条后期链：没有眩光/散射/暗角/色调/LUT/片边/日期。
+    if (this.filtersOff) {
+      return { pixels: pixels, w: w, h: h, stageMs: 'original' };
+    }
+    const payload: PostPayload = await this.buildPostPayload(pixels, w, h, tex);
     try {
       return (await taskpool.execute(new taskpool.Task(postTask, payload))) as PostResult;
     } catch (e) {
       console.warn('taskpool post unavailable, using main thread');
-      return this.applyPost(pixels, w, h, tex, light);
+      return this.applyPost(pixels, w, h, tex, payload.lights);
     }
+  }
+
+  /** 只跑调色链：结果与灯光无关，可以缓存后反复使用。 */
+  private async gradeAsync(payload: PostPayload): Promise<GradeResult> {
+    try {
+      return (await taskpool.execute(new taskpool.Task(gradeTask, payload))) as GradeResult;
+    } catch (e) {
+      console.warn('taskpool grade unavailable, using main thread');
+      return this.gradeMain(payload);
+    }
+  }
+
+  /** 只叠加灯光 + 片边 + 日期；入参必须是调用方自己的副本。 */
+  private async finishAsync(payload: PostPayload): Promise<PostResult> {
+    try {
+      return (await taskpool.execute(new taskpool.Task(finishTask, payload))) as PostResult;
+    } catch (e) {
+      console.warn('taskpool finish unavailable, using main thread');
+      return this.finishMain(payload);
+    }
+  }
+
+  private gradeMain(p: PostPayload): GradeResult {
+    const px: Uint8Array = p.pixels;
+    addHalationGlare(px, p.w, p.h, p.halation, p.glare);
+    addScatter(px, p.w, p.h, p.scatter);
+    addVignette(px, p.w, p.h, p.vignette);
+    adjustTone(px, p.w, p.h, p.contrast, p.saturation, p.brightness,
+      p.highlights, p.shadows);
+    convertP3ToSrgb(px, p.w, p.h);
+    for (let i = 0; i < p.luts.length; i++) {
+      const L: PostLut = p.luts[i];
+      if (L.table.length > 0 && L.strength > 0) {
+        applyColorLut(px, p.w, p.h, L.table, L.strength);
+      }
+    }
+    return { pixels: px, w: p.w, h: p.h, stageMs: 'main' };
+  }
+
+  private finishMain(p: PostPayload): PostResult {
+    for (let i = 0; i < p.lights.length; i++) {
+      const L: PostLight = p.lights[i];
+      applyLightLayer(p.pixels, p.w, p.h, L.tex, L.w, L.h, L.opacity, L.scale,
+        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV);
+    }
+    let edge: EdgeResult;
+    if (p.edgeTex !== undefined && p.edgeW !== undefined && p.edgeH !== undefined &&
+      p.edgeW > 0 && p.edgeH > 0) {
+      if (p.edgePpm !== undefined && p.edgePpm > 0) {
+        edge = composeMediumEdge(p.pixels, p.w, p.h, p.edgeTex, p.edgeW, p.edgeH,
+          p.edgePpm, p.edgeRotate === true);
+      } else {
+        edge = composeFilmEdge(p.pixels, p.w, p.h, p.edgeTex, p.edgeW, p.edgeH,
+          p.edgeRotate === true);
+      }
+    } else {
+      edge = addFilmEdge(p.pixels, p.w, p.h, p.edgeMode);
+    }
+    if (p.dateBack) {
+      addDateBack(edge.pixels, edge.w, edge.h, p.dateText, edge.band);
+    }
+    return { pixels: edge.pixels, w: edge.w, h: edge.h, stageMs: 'main' };
+  }
+
+  /** 内置滤镜栈签名：滤镜或强度任一变化都要重新调色。 */
+  private lutSignature(): string {
+    const luts: LutLayer[] = this.allLuts();
+    let sig: string = '';
+    for (let i = 0; i < luts.length; i++) {
+      const f: FilterEntry | undefined = this.filters[luts[i].index];
+      if (f === undefined) {
+        continue;
+      }
+      sig += luts[i].index + ':' + f.strength + ':' + luts[i].strength + ',';
+    }
+    return sig;
   }
 
   /** Film-edge palette keyed to the loaded stock. */
@@ -1245,6 +2232,26 @@ struct Index {
     this.originalPm = pm;
   }
 
+  /** 预览几何参数签名：任何影响旋转/裁剪/缩放的改动都会换键。 */
+  private geoSignature(): string {
+    return [this.photoGen, this.rotation, this.flipH ? 1 : 0, this.flipV ? 1 : 0,
+      this.lensCorrection, this.straighten, this.effAspect(), this.cropX, this.cropY,
+      this.filtersOff ? 1 : 0, this.previewW, this.previewH].join(',');
+  }
+
+  /** 胶片模拟签名：只包含 renderFull 真正读到的参数。 */
+  private filmSignature(pairs: FilmLayer[], shortKey: string): string {
+    let sig: string = shortKey + '|' + (this.autoExposure ? 1 : 0) + ',' + this.ev + ',' +
+      this.previewEv + ',' + this.meter;
+    for (let i: number = 0; i < pairs.length; i++) {
+      sig += '|' + pairs[i].film + ':' + pairs[i].paper;
+    }
+    sig += '|' + this.couplers + ',' + this.enlargerC + ',' + this.enlargerM + ',' +
+      this.enlargerY + ',' + this.preflash + ',' + this.edr + ',' + this.bwFilter + ',' +
+      this.highlightBoost + ',' + this.highlightHeadroom + ',' + this.grain;
+    return sig;
+  }
+
   async renderPreview(): Promise<void> {
     const src: Uint8Array | undefined = this.previewSrc;
     const film: FilmAssets | undefined = this.currentFilm();
@@ -1258,74 +2265,144 @@ struct Index {
     }
     this.busy = true;
     this.progress = 0;
-    const geo: GeoResult = await this.prepare(src, this.previewW, this.previewH, 0);
-    await this.refreshOriginalPm(geo);
-    let ev: number = this.ev;
-    if (this.autoExposure) {
-      this.previewEv = meterEv(geo.src, geo.w, geo.h, this.meter);
-      ev = this.previewEv;
-    }
-    this.histAcc = [];
-    for (let i = 0; i < HIST_BINS; i++) {
-      this.histAcc.push(0);
-    }
-    const w: number = geo.w;
-    const h: number = geo.h;
-    const t0: number = Date.now();
-    let passEv: number = ev;
-    let rendered: Uint8Array;
-    if (this.useFilmPass()) {
-      rendered = await this.renderFull(geo.src, w, h, ev);
-    } else {
-      // The meter targets the print's mid-grey, so it only applies to the
-      // spectral pass; pure-LUT mode keeps the source exposure untouched.
-      // ORIGINAL must ignore the EV slider entirely.
-      passEv = this.filtersOff ? 0.0 : (this.autoExposure ? 0.0 : ev);
-      rendered = this.exposureCopy(geo.src, passEv);
-    }
-    const tex: EdgeTexture | null = await this.ensureEdgeTexture();
-    const post: PostResult = await this.applyPostAsync(rendered, w, h, tex);
-    const out: Uint8Array = post.pixels;
-    const ow: number = post.w;
-    const oh: number = post.h;
-    for (let q = 0; q + 3 < out.length; q += 16) {
-      const lum: number = (out[q] * 0.2126 + out[q + 1] * 0.7152 + out[q + 2] * 0.0722) / 255.0;
-      let bin: number = Math.floor(lum * HIST_BINS);
-      bin = bin < 0 ? 0 : (bin >= HIST_BINS ? HIST_BINS - 1 : bin);
-      this.histAcc[bin] += 1;
-    }
-    const ms: number = Date.now() - t0;
-    // The PixelMap constructor on this platform keeps the buffer with R and B
-    // exchanged (a red-left test patch packs out blue), so the handoff is done
-    // in B,G,R order. Without this every warm photo came out blue in the
-    // preview and in the exported file.
-    for (let i = 0; i < out.length; i += 4) {
-      const t: number = out[i];
-      out[i] = out[i + 2];
-      out[i + 2] = t;
-    }
-    const pm: image.PixelMap = await image.createPixelMap(out.buffer, {
-      size: { width: ow, height: oh },
-      pixelFormat: image.PixelMapFormat.RGBA_8888,
-      alphaType: image.AlphaType.OPAQUE,
-      editable: false
-    });
-    if (this.displayPm !== undefined) {
-      await this.displayPm.release();
-    }
-    this.displayPm = pm;
-    this.outW = ow;
-    this.outH = oh;
-    this.hist = this.histAcc.slice();
-    this.busy = false;
-    this.progress = 1;
-    this.status = this.lookName() + ' · EV ' + passEv.toFixed(2) + ' · ' + ms + 'ms';
-    setTimeout(() => {
-      this.drawHist();
-    }, 0);
-    if (this.pendingRender) {
+    try {
+      const gkey: string = this.geoSignature();
+      let geo: GeoResult;
+      if (this.geoCacheBuf !== undefined && this.geoCacheKey === gkey) {
+        geo = { src: this.geoCacheBuf, w: this.geoCacheW, h: this.geoCacheH };
+      } else {
+        geo = await this.prepare(src, this.previewW, this.previewH, 0);
+        this.geoCacheBuf = geo.src;
+        this.geoCacheW = geo.w;
+        this.geoCacheH = geo.h;
+        this.geoCacheKey = gkey;
+      }
+      // 原图对比只跟几何有关，拖动灯光时没必要每次重建 PixelMap。
+      if (this.originalKey !== gkey) {
+        await this.refreshOriginalPm(geo);
+        this.originalKey = gkey;
+      }
+      let ev: number = this.ev;
+      if (this.autoExposure) {
+        this.previewEv = meterEv(geo.src, geo.w, geo.h, this.meter);
+        ev = this.previewEv;
+      }
+      this.histAcc = [];
+      for (let i = 0; i < HIST_BINS; i++) {
+        this.histAcc.push(0);
+      }
+      const w: number = geo.w;
+      const h: number = geo.h;
+      this.innerW = w;
+      this.innerH = h;
+      const t0: number = Date.now();
+      let passEv: number = ev;
+      let rendered: Uint8Array;
+      let inputSig: string = '';
+      if (this.useFilmPass()) {
+        const pairs: FilmLayer[] = this.allFilmPairs();
+        const fkey: string = this.filmSignature(pairs, gkey);
+        inputSig = fkey;
+        if (this.filmCacheBuf !== undefined && this.filmCacheKey === fkey) {
+          // 只改了灯光/灯位：胶片这一层结果完全一样，直接复用。
+          rendered = this.filmCacheBuf as Uint8Array;
+        } else {
+          // 没有胶片层时 geo.src 会被原样交给 taskpool；恒等几何下它就是
+          // previewSrc 本体，转移后缓存被 detach，下一次渲染报 detached buffer。
+          rendered = pairs.length > 0 ? geo.src : this.exposureCopy(geo.src, 0.0);
+          for (let i = 0; i < pairs.length; i++) {
+            rendered = await this.renderFull(rendered, w, h, ev, pairs[i]);
+          }
+          this.filmCacheBuf = rendered.slice();
+          this.filmCacheKey = fkey;
+        }
+      } else {
+        // The meter targets the print's mid-grey, so it only applies to the
+        // spectral pass; pure-LUT mode keeps the source exposure untouched.
+        // ORIGINAL must ignore the EV slider entirely.
+        passEv = this.filtersOff ? 0.0 : (this.autoExposure ? 0.0 : ev);
+        rendered = this.exposureCopy(geo.src, passEv);
+        inputSig = 'nf|' + gkey + '|' + passEv + ',' + this.previewEv;
+      }
+      let post: PostResult;
+      if (this.filtersOff) {
+        // 「原图」直通：调色链、灯光、片边、日期全部跳过。
+        post = { pixels: rendered, w: w, h: h, stageMs: 'original' };
+      } else {
+        const tex: EdgeTexture | null = await this.ensureEdgeTexture();
+        const gradeKey: string = inputSig + '|p|' + this.halation + ',' + this.glare + ',' +
+          this.scatter + ',' + this.vignette + ',' + this.toneContrast + ',' +
+          this.toneSaturation + ',' + this.toneBrightness + ',' + this.toneHighlights + ',' +
+          this.toneShadows + '|l|' + this.lutSignature();
+        let graded: Uint8Array;
+        let gradeCached: boolean = false;
+        if (this.gradeCacheBuf !== undefined && this.gradeCacheKey === gradeKey) {
+          // 只改了灯光：光晕/散射/暗角/色调/LUT 结果完全一样，整段复用。
+          graded = this.gradeCacheBuf;
+          gradeCached = true;
+        } else {
+          const gp: PostPayload = await this.buildPostPayload(rendered, w, h, tex, false);
+          const g: GradeResult = await this.gradeAsync(gp);
+          graded = g.pixels;
+          this.gradeCacheBuf = graded;
+          this.gradeCacheKey = gradeKey;
+        }
+        // finish 会转移（detach）入参，缓存本体必须留一份。
+        const fp: PostPayload = await this.buildPostPayload(graded.slice(), w, h, tex,
+          !this.lightLive());
+        post = await this.finishAsync(fp);
+      }
+      const out: Uint8Array = post.pixels;
+      const ow: number = post.w;
+      const oh: number = post.h;
+      for (let q = 0; q + 3 < out.length; q += 16) {
+        const lum: number = (out[q] * 0.2126 + out[q + 1] * 0.7152 + out[q + 2] * 0.0722) / 255.0;
+        let bin: number = Math.floor(lum * HIST_BINS);
+        bin = bin < 0 ? 0 : (bin >= HIST_BINS ? HIST_BINS - 1 : bin);
+        this.histAcc[bin] += 1;
+      }
+      const ms: number = Date.now() - t0;
+      // The PixelMap constructor on this platform keeps the buffer with R and B
+      // exchanged (a red-left test patch packs out blue), so the handoff is done
+      // in B,G,R order. Without this every warm photo came out blue in the
+      // preview and in the exported file.
+      for (let i = 0; i < out.length; i += 4) {
+        const t: number = out[i];
+        out[i] = out[i + 2];
+        out[i + 2] = t;
+      }
+      const pm: image.PixelMap = await image.createPixelMap(out.buffer, {
+        size: { width: ow, height: oh },
+        pixelFormat: image.PixelMapFormat.RGBA_8888,
+        alphaType: image.AlphaType.OPAQUE,
+        editable: false
+      });
+      if (this.displayPm !== undefined) {
+        await this.displayPm.release();
+      }
+      this.displayPm = pm;
+      // The lit frame is on screen now, so the drag overlay can go.
+      this.lightDragOn = false;
+      this.outW = ow;
+      this.outH = oh;
+      this.hist = this.histAcc.slice();
+      this.busy = false;
+      this.progress = 1;
+      this.status = this.lookName() + ' · EV ' + passEv.toFixed(2) + ' · ' + ms + 'ms';
+      setTimeout(() => {
+        this.drawHist();
+      }, 0);
+      if (this.pendingRender) {
+        this.pendingRender = false;
+        await this.renderPreview();
+      }
+    } catch (e) {
+      // 任何一步失败都必须把 busy 复位，否则界面会永远停在「处理中」和旧画面上。
+      this.busy = false;
       this.pendingRender = false;
-      await this.renderPreview();
+      this.progress = 0;
+      this.status = '渲染失败';
+      console.error('renderPreview failed: ' + (e !== null && e !== undefined && (e as Error).message !== undefined ? (e as Error).message : String(e)));
     }
   }
 
@@ -1404,7 +2481,12 @@ struct Index {
       let passEv: number = ev;
       let rendered: Uint8Array;
       if (this.useFilmPass()) {
-        rendered = await this.renderFull(g.src, fw, fh, ev);
+        const pairs: FilmLayer[] = this.allFilmPairs();
+        // 同上：空叠加栈时 g.src 可能就是 fullSrc 本体，不能直接交给 taskpool。
+        rendered = pairs.length > 0 ? g.src : this.exposureCopy(g.src, 0.0);
+        for (let i = 0; i < pairs.length; i++) {
+          rendered = await this.renderFull(rendered, fw, fh, ev, pairs[i]);
+        }
       } else {
         passEv = this.filtersOff ? 0.0 : (this.autoExposure ? 0.0 : ev);
         rendered = this.exposureCopy(g.src, passEv);
@@ -1480,7 +2562,7 @@ struct Index {
       const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
       const helper: photoAccessHelper.PhotoAccessHelper = photoAccessHelper.getPhotoAccessHelper(ctx);
       const cfg: photoAccessHelper.PhotoCreationConfig = {
-        title: 'SpektraLab_' + Date.now(),
+        title: 'DigitalFilm_' + Date.now(),
         fileNameExtension: ext, 
         photoType: photoAccessHelper.PhotoType.IMAGE
       };
@@ -1639,26 +2721,28 @@ struct Index {
 
   @Builder
   headerLabel(zh: string, en: string) {
-    Text(this.t(zh, en))
-      .fontSize(9)
-      .letterSpacing(1.4)
-      .fontColor(Theme.dim)
+    Row() {
+      Row()
+        .width(2)
+        .height(9)
+        .backgroundColor(Theme.accent)
+        .margin({ right: 6 })
+      Text(this.t(zh, en))
+        .fontSize(9)
+        .letterSpacing(1.6)
+        .fontColor(Theme.ruler)
+    }
+    .alignItems(VerticalAlign.Center)
   }
 
   @Builder
   topBar() {
     Row() {
-      Text('PFILTERLAB')
+      Text('DigitalFilm')
         .fontSize(10)
         .letterSpacing(1.6)
         .fontColor(Theme.dim)
-      Text(this.currentFilm() !== undefined ? this.currentFilm()!.name : '')
-        .fontSize(10)
-        .fontColor(Theme.secondary)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .margin({ left: 8 })
-        .layoutWeight(1)
+      Blank()
       Text(this.busy ? this.t('处理中 ', 'PROCESSING ') + Math.round(this.progress * 100) + '%' :
         this.t('就绪', 'READY'))
         .fontSize(9)
@@ -1671,7 +2755,7 @@ struct Index {
         .opacity(this.undoCount > 0 ? 1.0 : 0.4)
         .padding({ left: 8, right: 8, top: 5, bottom: 5 })
         .onClick(() => this.undo())
-      Text(this.t('原图', 'ORIGINAL'))
+      Text(this.t('对比', 'HOLD'))
         .fontSize(9)
         .letterSpacing(0.8)
         .fontColor(this.showOriginal ? Theme.accent : Theme.secondary)
@@ -1681,6 +2765,26 @@ struct Index {
             this.showOriginal = true;
           } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
             this.showOriginal = false;
+          }
+        })
+      // 一键回到原图：不再藏在滤镜子页签里，任何场景都能直接点。
+      Text(this.t('原图', 'RESET'))
+        .fontSize(9)
+        .letterSpacing(0.8)
+        .fontColor(this.filtersOff ? Theme.accent : Theme.secondary)
+        .padding({ left: 8, right: 8, top: 5, bottom: 5 })
+        .onClick(() => this.resetToOriginal())
+      Text(this.t('直方图', 'HIST'))
+        .fontSize(9)
+        .letterSpacing(0.8)
+        .fontColor(this.showHist ? Theme.accent : Theme.dim)
+        .padding({ left: 7, right: 7, top: 5, bottom: 5 })
+        .onClick(() => {
+          this.showHist = !this.showHist;
+          if (this.showHist) {
+            setTimeout(() => {
+              this.drawHist();
+            }, 0);
           }
         })
       Text(Math.round(this.zoomK * 100) + '%')
@@ -1728,6 +2832,8 @@ struct Index {
         .textAlign(TextAlign.Center)
         .margin({ top: 8 })
       Button(this.t('选择照片', 'SELECT PHOTO'))
+        .type(ButtonType.Normal)
+        .borderRadius(4)
         .height(36)
         .width(132)
         .fontSize(12)
@@ -1803,11 +2909,11 @@ struct Index {
           .fontSize(11)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .fontColor(i === this.filmIndex ? Theme.onSelection : Theme.text)
+          .fontColor(this.filmSel(i) ? Theme.accent : Theme.text)
         Text(filmFlags(f))
           .fontSize(7.5)
           .letterSpacing(0.6)
-          .fontColor(i === this.filmIndex ? '#6B6A64' : Theme.dim)
+          .fontColor(this.filmSel(i) ? '#6B6A64' : Theme.dim)
           .margin({ top: 2 })
       }
       .alignItems(HorizontalAlign.Start)
@@ -1816,16 +2922,16 @@ struct Index {
       if (this.isCineFilm(f)) {
         Text('CINE')
           .fontSize(6.5)
-          .fontColor(i === this.filmIndex ? '#8A5B1E' : Theme.accent)
-          .border({ width: 1, color: i === this.filmIndex ? '#C79A5C' : Theme.accent })
+          .fontColor(this.filmSel(i) ? '#8A5B1E' : Theme.accent)
+          .border({ width: 1, color: this.filmSel(i) ? '#C79A5C' : Theme.accent })
           .borderRadius(3)
           .padding({ left: 4, right: 4, top: 1, bottom: 1 })
           .margin({ right: 8 })
       }
-      if (i === this.filmIndex) {
+      if (this.filmSel(i)) {
         Text('✓')
           .fontSize(12)
-          .fontColor(Theme.onSelection)
+          .fontColor(Theme.accent)
           .width(14)
       } else {
         Blank()
@@ -1835,17 +2941,11 @@ struct Index {
     .width('100%')
     .height(54)
     .padding({ left: 8, right: 6 })
-    .backgroundColor(i === this.filmIndex ? Theme.selection : Theme.card)
-    .borderRadius(8)
-    .border({ width: 1, color: i === this.filmIndex ? Theme.selection : Theme.rule })
+    .backgroundColor(this.filmSel(i) ? Theme.cardRaised : Theme.card)
+    .borderRadius(4)
+    .border({ width: 1, color: this.filmSel(i) ? Theme.accent : Theme.rule })
     .margin({ bottom: 4 })
-    .onClick(() => {
-      this.pushUndo();
-      this.leaveOriginal();
-      this.filmIndex = i;
-      this.pickMode = 0;
-      this.renderPreview();
-    })
+    .onClick(() => this.selectFilm(i))
   }
 
   @Builder
@@ -1858,12 +2958,12 @@ struct Index {
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .fontColor(this.isPositiveFilm() ? Theme.dim
-            : (i === this.paperIndex ? Theme.onSelection : Theme.text))
+            : (this.paperSel(i) ? Theme.accent : Theme.text))
         Text(this.pairLabel(p.pairedFilm))
           .fontSize(7.5)
           .letterSpacing(0.6)
           .fontColor(this.isPositiveFilm() ? '#5E5D58'
-            : (i === this.paperIndex ? '#6B6A64' : Theme.dim))
+            : (this.paperSel(i) ? '#6B6A64' : Theme.dim))
           .margin({ top: 2 })
       }
       .alignItems(HorizontalAlign.Start)
@@ -1873,17 +2973,17 @@ struct Index {
         Text('CINE')
           .fontSize(6.5)
           .fontColor(this.isPositiveFilm() ? '#5E5D58'
-            : (i === this.paperIndex ? '#8A5B1E' : Theme.accent))
+            : (this.paperSel(i) ? '#8A5B1E' : Theme.accent))
           .border({ width: 1, color: this.isPositiveFilm() ? Theme.rule
-            : (i === this.paperIndex ? '#C79A5C' : Theme.accent) })
+            : (this.paperSel(i) ? '#C79A5C' : Theme.accent) })
           .borderRadius(3)
           .padding({ left: 4, right: 4, top: 1, bottom: 1 })
           .margin({ right: 8 })
       }
-      if (i === this.paperIndex && !this.isPositiveFilm()) {
+      if (this.paperSel(i)) {
         Text('✓')
           .fontSize(12)
-          .fontColor(Theme.onSelection)
+          .fontColor(Theme.accent)
           .width(14)
       } else {
         Blank()
@@ -1893,9 +2993,9 @@ struct Index {
     .width('100%')
     .height(54)
     .padding({ left: 8, right: 6 })
-    .backgroundColor(i === this.paperIndex && !this.isPositiveFilm() ? Theme.selection : Theme.card)
-    .borderRadius(8)
-    .border({ width: 1, color: i === this.paperIndex && !this.isPositiveFilm() ? Theme.selection : Theme.rule })
+    .backgroundColor(this.paperSel(i) ? Theme.cardRaised : Theme.card)
+    .borderRadius(4)
+    .border({ width: 1, color: this.paperSel(i) ? Theme.accent : Theme.rule })
     .margin({ bottom: 4 })
     .onClick(() => {
       if (this.isPositiveFilm()) {
@@ -1906,6 +3006,7 @@ struct Index {
       this.pushUndo();
       this.leaveOriginal();
       this.paperIndex = i;
+      this.filmDraft = true;
       this.pickMode = 0;
       this.renderPreview();
     })
@@ -1920,6 +3021,7 @@ struct Index {
             .width(54)
             .height(54)
             .objectFit(ImageFit.Contain)
+            .opacity(this.filtersOff ? 0.35 : 1.0)
         } else {
           Column() {
             Row()
@@ -1950,15 +3052,20 @@ struct Index {
               .borderRadius({ bottomLeft: 4, bottomRight: 4 })
           }
           .width(38)
+          .opacity(this.filtersOff ? 0.35 : 1.0)
         }
       }
       Column() {
-        Text(this.currentFilm() === undefined ? this.t('载入中', 'LOADING') : this.currentFilm()!.name)
+        Text(this.filtersOff
+          ? this.t('未选择胶卷', 'NO FILM PICKED')
+          : (this.currentFilm() === undefined ? this.t('载入中', 'LOADING') : this.currentFilm()!.name))
           .fontSize(12)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .fontColor(Theme.text)
-        Text(this.currentFilm() === undefined ? '' : filmFlags(this.currentFilm() as FilmAssets))
+          .fontColor(this.filtersOff ? Theme.secondary : Theme.text)
+        Text(this.filtersOff
+          ? this.t('点右侧选择胶卷后才套用', 'PICK A STOCK TO APPLY')
+          : (this.currentFilm() === undefined ? '' : filmFlags(this.currentFilm() as FilmAssets)))
           .fontSize(7.5)
           .letterSpacing(0.6)
           .fontColor(Theme.dim)
@@ -1967,7 +3074,7 @@ struct Index {
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       .margin({ left: 10 })
-      Text(this.t('更换 ›', 'CHANGE ›'))
+      Text(this.filtersOff ? this.t('选择 ›', 'PICK ›') : this.t('更换 ›', 'CHANGE ›'))
         .fontSize(9)
         .fontColor(Theme.accent)
         .padding({ left: 10, right: 10, top: 6, bottom: 6 })
@@ -1978,7 +3085,7 @@ struct Index {
     .height(58)
     .padding({ left: 10, right: 10 })
     .backgroundColor(Theme.card)
-    .borderRadius(8)
+    .borderRadius(4)
     .border({ width: 1, color: Theme.rule })
     .onClick(() => {
       this.pickMode = 1;
@@ -1996,14 +3103,18 @@ struct Index {
       Column() {
         Text(this.isPositiveFilm()
           ? this.t('无相纸 · 直接扫描', 'NO PAPER · SCAN ONLY')
-          : (this.currentPaper() === undefined ? this.t('载入中', 'LOADING') : this.currentPaper()!.name))
+          : (this.filtersOff
+            ? this.t('未选择相纸', 'NO PAPER PICKED')
+            : (this.currentPaper() === undefined ? this.t('载入中', 'LOADING') : this.currentPaper()!.name)))
           .fontSize(12)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .fontColor(this.isPositiveFilm() ? Theme.secondary : Theme.text)
         Text(this.isPositiveFilm()
           ? this.t('正片无需印相，选负片可用相纸', 'SLIDE IS FINAL — PICK A NEGATIVE TO PRINT')
-          : (this.currentPaper() === undefined ? '' : this.pairLabel(this.currentPaper()!.pairedFilm)))
+          : (this.filtersOff
+            ? this.t('点右侧选择相纸后才套用', 'PICK A PAPER TO APPLY')
+            : (this.currentPaper() === undefined ? '' : this.pairLabel(this.currentPaper()!.pairedFilm))))
           .fontSize(7.5)
           .letterSpacing(0.6)
           .fontColor(Theme.dim)
@@ -2012,7 +3123,7 @@ struct Index {
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       .margin({ left: 10 })
-      Text(this.t('更换 ›', 'CHANGE ›'))
+      Text(this.filtersOff ? this.t('选择 ›', 'PICK ›') : this.t('更换 ›', 'CHANGE ›'))
         .fontSize(9)
         .fontColor(Theme.accent)
         .padding({ left: 10, right: 10, top: 6, bottom: 6 })
@@ -2023,7 +3134,7 @@ struct Index {
     .height(58)
     .padding({ left: 10, right: 10 })
     .backgroundColor(Theme.card)
-    .borderRadius(8)
+    .borderRadius(4)
     .border({ width: 1, color: Theme.rule })
     .onClick(() => {
       this.pickMode = 2;
@@ -2137,9 +3248,9 @@ struct Index {
   ratioChip(zh: string, en: string, value: number, id: string) {
     Text(this.t(zh, en))
       .fontSize(9)
-      .fontColor(this.aspectId === id ? Theme.onSelection : Theme.secondary)
-      .backgroundColor(this.aspectId === id ? Theme.selection : Theme.card)
-      .border({ width: 1, color: this.aspectId === id ? Theme.selection : Theme.rule })
+      .fontColor(this.aspectId === id ? Theme.accent : Theme.secondary)
+      .backgroundColor(this.aspectId === id ? Theme.cardRaised : Theme.card)
+      .border({ width: 1, color: this.aspectId === id ? Theme.accent : Theme.rule })
       .borderRadius(2)
       .padding({ left: 8, right: 8, top: 4, bottom: 4 })
       .margin({ right: 6, bottom: 4 })
@@ -2157,9 +3268,9 @@ struct Index {
   recipeChip(label: string, value: number) {
     Text(label)
       .fontSize(9)
-      .fontColor(this.recipe === value ? Theme.onSelection : Theme.secondary)
-      .backgroundColor(this.recipe === value ? Theme.selection : Theme.card)
-      .border({ width: 1, color: this.recipe === value ? Theme.selection : Theme.rule })
+      .fontColor(this.recipe === value ? Theme.accent : Theme.secondary)
+      .backgroundColor(this.recipe === value ? Theme.cardRaised : Theme.card)
+      .border({ width: 1, color: this.recipe === value ? Theme.accent : Theme.rule })
       .borderRadius(2)
       .padding({ left: 8, right: 8, top: 4, bottom: 4 })
       .margin({ right: 6 })
@@ -2172,9 +3283,9 @@ struct Index {
   filterTabChip(zh: string, en: string, value: number) {
     Text(this.t(zh, en))
       .fontSize(9)
-      .fontColor(this.filterTab === value ? Theme.onSelection : Theme.secondary)
-      .backgroundColor(this.filterTab === value ? Theme.selection : Theme.card)
-      .border({ width: 1, color: this.filterTab === value ? Theme.selection : Theme.rule })
+      .fontColor(this.filterTab === value ? Theme.accent : Theme.secondary)
+      .backgroundColor(this.filterTab === value ? Theme.cardRaised : Theme.card)
+      .border({ width: 1, color: this.filterTab === value ? Theme.accent : Theme.rule })
       .borderRadius(2)
       .padding({ left: 10, right: 10, top: 5, bottom: 5 })
       .margin({ right: 6 })
@@ -2185,19 +3296,50 @@ struct Index {
       })
   }
 
-  /** 关闭全部滤镜，回到原图初始状态。 */
+  /** 抽屉顶部的场景分页，把控件按使用场景拆开。 */
   @Builder
-  originalChip() {
-    Text(this.t('原图', 'ORIGINAL'))
+  sceneChip(zh: string, en: string, index: number) {
+    Column() {
+      Text(this.t(zh, en))
+        .fontSize(10)
+        .letterSpacing(1.0)
+        .fontColor(this.drawerTab === index ? Theme.accent : Theme.dim)
+        .layoutWeight(1)
+        .textAlign(TextAlign.Center)
+      Row()
+        .width('100%')
+        .height(2)
+        .backgroundColor(this.drawerTab === index ? Theme.accent : Color.Transparent)
+    }
+    .justifyContent(FlexAlign.Center)
+    .height(30)
+    .layoutWeight(1)
+    .onClick(() => {
+      this.setDrawerTab(index);
+    })
+  }
+
+  @Builder
+  lightFlipChip(zh: string, en: string, horizontal: boolean) {
+    Text(this.t(zh, en))
       .fontSize(9)
-      .fontColor(this.filtersOff ? Theme.onSelection : Theme.secondary)
-      .backgroundColor(this.filtersOff ? Theme.selection : Theme.card)
-      .border({ width: 1, color: this.filtersOff ? Theme.selection : Theme.rule })
+      .fontColor((horizontal ? this.lightFlipH : this.lightFlipV) ? Theme.accent : Theme.secondary)
+      .backgroundColor((horizontal ? this.lightFlipH : this.lightFlipV) ? Theme.cardRaised : Theme.card)
+      .border({
+        width: 1,
+        color: (horizontal ? this.lightFlipH : this.lightFlipV) ? Theme.accent : Theme.rule
+      })
       .borderRadius(2)
-      .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-      .margin({ right: 6 })
+      .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+      .margin({ left: 6 })
       .onClick(() => {
-        this.resetToOriginal();
+        this.lightDraft = true;
+        if (horizontal) {
+          this.lightFlipH = !this.lightFlipH;
+        } else {
+          this.lightFlipV = !this.lightFlipV;
+        }
+        this.afterLightEdit();
       })
   }
 
@@ -2205,25 +3347,13 @@ struct Index {
   lightChip(index: number, zh: string, en: string) {
     Text(this.t(zh, en))
       .fontSize(9)
-      .fontColor(this.lightIndex === index ? Theme.onSelection : Theme.secondary)
-      .backgroundColor(this.lightIndex === index ? Theme.selection : Theme.card)
-      .border({ width: 1, color: this.lightIndex === index ? Theme.selection : Theme.rule })
+      .fontColor(this.lightIndex === index ? Theme.accent : Theme.secondary)
+      .backgroundColor(this.lightIndex === index ? Theme.cardRaised : Theme.card)
+      .border({ width: 1, color: this.lightIndex === index ? Theme.accent : Theme.rule })
       .borderRadius(2)
       .padding({ left: 8, right: 8, top: 4, bottom: 4 })
       .margin({ right: 6, bottom: 4 })
-      .onClick(() => {
-        this.pushUndo();
-        this.leaveOriginal();
-        this.lightIndex = index;
-        if (index > 0) {
-          const p: LightPreset = LIGHT_PRESETS[index - 1];
-          this.lightStrength = p.strength;
-          this.lightScale = p.scale;
-          this.lightX = 0;
-          this.lightY = 0;
-        }
-        this.renderPreview();
-      })
+      .onClick(() => this.selectLight(index))
   }
 
   /** The whole film + paper selection, kept as one sub-item of 滤镜. */
@@ -2255,15 +3385,16 @@ struct Index {
       .margin({ top: 8, bottom: 6 })
 
       this.paperSelector()
+
   }
 
   @Builder
   lutChip(labelZh: string, labelEn: string, index: number) {
     Text(this.t(labelZh, labelEn))
       .fontSize(9)
-      .fontColor(this.lutIndex === index ? Theme.onSelection : Theme.secondary)
-      .backgroundColor(this.lutIndex === index ? Theme.selection : Theme.card)
-      .border({ width: 1, color: this.lutIndex === index ? Theme.selection : Theme.rule })
+      .fontColor(this.lutIndex === index ? Theme.accent : Theme.secondary)
+      .backgroundColor(this.lutIndex === index ? Theme.cardRaised : Theme.card)
+      .border({ width: 1, color: this.lutIndex === index ? Theme.accent : Theme.rule })
       .borderRadius(2)
       .padding({ left: 8, right: 8, top: 4, bottom: 4 })
       .margin({ right: 6, bottom: 6 })
@@ -2303,7 +3434,8 @@ struct Index {
         Slider({ value: this.lutStrength, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .enabled(this.lutIndex >= 0)
           .onChange((value: number, mode: SliderChangeMode) => {
@@ -2311,6 +3443,7 @@ struct Index {
             if (mode === SliderChangeMode.Begin) {
               this.pushUndo();
             }
+            this.lutDraft = true;
             this.lutStrength = value;
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
@@ -2324,6 +3457,7 @@ struct Index {
       }
       .width('100%')
       .margin({ top: 6 })
+
 
       Row() {
         this.hintLabel('叠加胶片', 'STACK FILM',
@@ -2360,7 +3494,20 @@ struct Index {
         .strokeWidth(1)
         .color(Theme.rule)
       Row() {
-        this.headerLabel('滤镜', 'FILTER')
+        this.sceneChip('滤镜', 'FILTER', 0)
+        this.sceneChip('光学', 'OPTICS', 1)
+        this.sceneChip('灯光', 'LIGHT', 5)
+        this.sceneChip('构图', 'FRAME', 2)
+        this.sceneChip('调色', 'COLOR', 3)
+        this.sceneChip('输出', 'OUTPUT', 4)
+      }
+      .width('100%')
+      .margin({ top: 8, bottom: 8 })
+
+      if (this.drawerTab === 0) {
+      Scroll() {
+        Column() {
+      Row() {
         Blank()
         Text(this.filtersOff
           ? this.t('滤镜已关 · 原图', 'FILTERS OFF · ORIGINAL')
@@ -2376,7 +3523,6 @@ struct Index {
       Row() {
         this.filterTabChip('胶卷', 'FILM', 0)
         this.filterTabChip('内置滤镜', 'TABLES', 1)
-        this.originalChip()
         Blank()
       }
       .width('100%')
@@ -2386,7 +3532,18 @@ struct Index {
       } else {
         this.lutSection()
       }
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .constraintSize({ minHeight: '100%' })
+      }
+      .scrollable(ScrollDirection.Vertical)
+      .scrollBar(BarState.Off)
+      .width('100%')
+      .height(238)
+      }
 
+      if (this.drawerTab === 3) {
       Row() {
         Text('EV')
           .fontSize(9)
@@ -2404,7 +3561,8 @@ struct Index {
         })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .enabled(!this.autoExposure)
           .onChange((value: number, mode: SliderChangeMode) => {
@@ -2435,10 +3593,12 @@ struct Index {
       .width('100%')
       .margin({ top: 6 })
       .alignItems(VerticalAlign.Center)
+      }
 
+      if (this.drawerTab !== 0) {
       Scroll() {
         Column() {
-      if (this.autoExposure) {
+      if (this.drawerTab === 3 && this.autoExposure) {
         Row() {
           Text(this.t('测光模式', 'METERING'))
             .fontSize(9)
@@ -2462,6 +3622,7 @@ struct Index {
         .alignItems(VerticalAlign.Center)
       }
 
+      if (this.drawerTab === 3) {
       Row() {
         this.hintLabel('预闪', 'PRE-FLASH',
           '预闪：均匀预曝光，提亮暗部并降低对比',
@@ -2469,7 +3630,8 @@ struct Index {
         Slider({ value: this.preflash, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2488,6 +3650,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.drawerTab === 2) {
       Flex({ wrap: FlexWrap.Wrap }) {
         this.hintLabel('画面', 'FRAME',
           '裁剪比例；胶卷画幅：半幅 3:4、135 3:2、6×6 1:1、6×7 5:4、6×9 3:2',
@@ -2513,7 +3678,8 @@ struct Index {
         Slider({ value: this.straighten, min: -45, max: 45, step: 0.2, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2539,7 +3705,8 @@ struct Index {
         Slider({ value: this.lensCorrection, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2587,9 +3754,9 @@ struct Index {
         Blank()
         Text('H')
           .fontSize(10)
-          .fontColor(this.flipH ? Theme.onSelection : Theme.secondary)
-          .backgroundColor(this.flipH ? Theme.selection : Theme.card)
-          .border({ width: 1, color: this.flipH ? Theme.selection : Theme.rule })
+          .fontColor(this.flipH ? Theme.accent : Theme.secondary)
+          .backgroundColor(this.flipH ? Theme.cardRaised : Theme.card)
+          .border({ width: 1, color: this.flipH ? Theme.accent : Theme.rule })
           .borderRadius(2)
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .onClick(() => {
@@ -2599,9 +3766,9 @@ struct Index {
           })
         Text('V')
           .fontSize(10)
-          .fontColor(this.flipV ? Theme.onSelection : Theme.secondary)
-          .backgroundColor(this.flipV ? Theme.selection : Theme.card)
-          .border({ width: 1, color: this.flipV ? Theme.selection : Theme.rule })
+          .fontColor(this.flipV ? Theme.accent : Theme.secondary)
+          .backgroundColor(this.flipV ? Theme.cardRaised : Theme.card)
+          .border({ width: 1, color: this.flipV ? Theme.accent : Theme.rule })
           .borderRadius(2)
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .margin({ left: 6 })
@@ -2615,58 +3782,9 @@ struct Index {
       .margin({ top: 4 })
       .alignItems(VerticalAlign.Center)
 
-      Row() {
-        this.hintLabel('颗粒', 'GRAIN',
-          '胶片颗粒：模拟银盐晶体，中间调最明显',
-          'Film grain: silver-halide texture, strongest in midtones')
-        Slider({ value: this.grain, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
-        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
-          .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
-          .layoutWeight(1)
-          .onChange((value: number, mode: SliderChangeMode) => {
-            this.leaveOriginal();
-            this.grain = value;
-            if (mode === SliderChangeMode.End) {
-              this.renderPreview();
-            }
-          })
-        Text(Math.round(this.grain).toString())
-          .fontSize(10)
-          .fontColor(Theme.secondary)
-          .width(26)
-          .textAlign(TextAlign.End)
       }
-      .width('100%')
-      .margin({ top: 2 })
-      .alignItems(VerticalAlign.Center)
 
-      Row() {
-        this.hintLabel('光晕', 'HALATION',
-          '光晕：高光在片基反射形成的橙红光晕',
-          'Halation: warm glow bleeding around highlights')
-        Slider({ value: this.halation, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
-        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
-          .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
-          .layoutWeight(1)
-          .onChange((value: number, mode: SliderChangeMode) => {
-            this.leaveOriginal();
-            this.halation = value;
-            if (mode === SliderChangeMode.End) {
-              this.renderPreview();
-            }
-          })
-        Text(Math.round(this.halation).toString())
-          .fontSize(10)
-          .fontColor(Theme.secondary)
-          .width(26)
-          .textAlign(TextAlign.End)
-      }
-      .width('100%')
-      .margin({ top: 2 })
-      .alignItems(VerticalAlign.Center)
-
+      if (this.drawerTab === 3) {
       Row() {
         this.hintLabel('EDR', 'EDR',
           '扩展动态范围：压缩打印高光肩部，保留高光层次',
@@ -2674,7 +3792,8 @@ struct Index {
         Slider({ value: this.edr, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2700,7 +3819,8 @@ struct Index {
         Slider({ value: this.toneHighlights, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2726,7 +3846,8 @@ struct Index {
         Slider({ value: this.toneShadows, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2745,6 +3866,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.drawerTab === 1) {
       Row() {
         this.headerLabel('画质', 'LOOK')
         Blank()
@@ -2763,7 +3887,8 @@ struct Index {
         Slider({ value: this.glare, min: 0, max: 30, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2789,7 +3914,8 @@ struct Index {
         Slider({ value: this.scatter, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2815,7 +3941,8 @@ struct Index {
         Slider({ value: this.vignette, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -2834,6 +3961,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.drawerTab === 5) {
       Row() {
         this.headerLabel('灯光', 'LIGHT')
         Blank()
@@ -2845,6 +3975,13 @@ struct Index {
       .width('100%')
       .margin({ top: 6 })
 
+      Text(this.t('切换素材会自动叠加；「无」只关闭面板里这一盏',
+        'Switching a light stacks the previous one; NONE clears the live one'))
+        .fontSize(8)
+        .fontColor(Theme.dim)
+        .width('100%')
+        .margin({ top: 4, bottom: 2 })
+
       Flex({ wrap: FlexWrap.Wrap }) {
         this.lightChip(0, '无', 'NONE')
         ForEach(LIGHT_PRESETS, (p: LightPreset, i: number) => {
@@ -2854,6 +3991,49 @@ struct Index {
       .width('100%')
       .margin({ top: 2 })
 
+      // 已叠加的灯光列表：切换素材时上一盏会自动入栈，在这里能看见、能改、能删。
+      if (this.lightLayers.length > 0) {
+        Row() {
+          this.headerLabel('已叠加灯光', 'STACKED')
+          Blank()
+          Text(this.lightLayers.length + this.t(' 层', ' LAYERS'))
+            .fontSize(9)
+            .fontColor(Theme.dim)
+        }
+        .width('100%')
+        .margin({ top: 8, bottom: 2 })
+
+        Scroll() {
+          Column() {
+            ForEach(this.lightLayers, (l: LightLayer) => {
+              Row() {
+                Text(this.presetName(l.preset))
+                  .fontSize(9)
+                  .fontColor(Theme.text)
+                  .layoutWeight(1)
+                  .onClick(() => this.editLightLayer(l.id))
+                Text(Math.round(l.strength) + '% · ' + Math.round(l.scale) + '%')
+                  .fontSize(8)
+                  .fontColor(Theme.dim)
+                  .margin({ right: 10 })
+                Text('✕')
+                  .fontSize(10)
+                  .fontColor(Theme.accent)
+                  .padding({ left: 8, right: 8 })
+                  .onClick(() => this.removeLightLayer(l.id))
+              }
+              .width('100%')
+              .padding({ top: 5, bottom: 5 })
+            }, (l: LightLayer) => 'sl' + l.id + '-' + l.rot)
+          }
+          .width('100%')
+        }
+        .scrollable(ScrollDirection.Vertical)
+        .scrollBar(BarState.Auto)
+        .width('100%')
+        .height(this.lightLayers.length > 3 ? 84 : this.lightLayers.length * 30 + 4)
+      }
+
       if (this.lightIndex > 0) {
         Row() {
           this.hintLabel('强度', 'STRENGTH',
@@ -2862,12 +4042,14 @@ struct Index {
           Slider({ value: this.lightStrength, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
           .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
             .selectedColor(Theme.accent)
-            .trackColor(Theme.rule)
+            .trackColor(Theme.track)
+          .trackThickness(4)
             .layoutWeight(1)
             .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightDraft = true;
               this.lightStrength = value;
               if (mode === SliderChangeMode.End) {
-                this.renderPreview();
+                this.afterLightEdit();
               }
             })
           Text(Math.round(this.lightStrength).toString())
@@ -2887,12 +4069,14 @@ struct Index {
           Slider({ value: this.lightScale, min: 10, max: 250, step: 1, style: SliderStyle.InSet })
           .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
             .selectedColor(Theme.accent)
-            .trackColor(Theme.rule)
+            .trackColor(Theme.track)
+          .trackThickness(4)
             .layoutWeight(1)
             .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightDraft = true;
               this.lightScale = value;
               if (mode === SliderChangeMode.End) {
-                this.renderPreview();
+                this.afterLightEdit();
               }
             })
           Text(Math.round(this.lightScale).toString())
@@ -2909,15 +4093,17 @@ struct Index {
           this.hintLabel('横向', 'MOVE X',
             '灯光横向位置',
             'Light horizontal position')
-          Slider({ value: this.lightX, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
+          Slider({ value: this.lightX, min: -50, max: 50, step: 1, style: SliderStyle.InSet })
           .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
             .selectedColor(Theme.accent)
-            .trackColor(Theme.rule)
+            .trackColor(Theme.track)
+          .trackThickness(4)
             .layoutWeight(1)
             .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightDraft = true;
               this.lightX = value;
               if (mode === SliderChangeMode.End) {
-                this.renderPreview();
+                this.afterLightEdit();
               }
             })
           Text(Math.round(this.lightX).toString())
@@ -2934,15 +4120,17 @@ struct Index {
           this.hintLabel('纵向', 'MOVE Y',
             '灯光纵向位置',
             'Light vertical position')
-          Slider({ value: this.lightY, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
+          Slider({ value: this.lightY, min: -50, max: 50, step: 1, style: SliderStyle.InSet })
           .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
             .selectedColor(Theme.accent)
-            .trackColor(Theme.rule)
+            .trackColor(Theme.track)
+          .trackThickness(4)
             .layoutWeight(1)
             .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightDraft = true;
               this.lightY = value;
               if (mode === SliderChangeMode.End) {
-                this.renderPreview();
+                this.afterLightEdit();
               }
             })
           Text(Math.round(this.lightY).toString())
@@ -2954,8 +4142,110 @@ struct Index {
         .width('100%')
         .margin({ top: 2 })
         .alignItems(VerticalAlign.Center)
+
+        Row() {
+          this.hintLabel('旋转', 'ROTATE',
+            '灯光旋转角度',
+            'Light rotation in degrees')
+          Slider({ value: this.lightRot, min: -180, max: 180, step: 1, style: SliderStyle.InSet })
+            .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .selectedColor(Theme.accent)
+            .trackColor(Theme.track)
+            .trackThickness(4)
+            .layoutWeight(1)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.lightDraft = true;
+              this.lightRot = value;
+              if (mode === SliderChangeMode.End) {
+                this.afterLightEdit();
+              }
+            })
+          Text(Math.round(this.lightRot) + '°')
+            .fontSize(10)
+            .fontColor(Theme.secondary)
+            .width(34)
+            .textAlign(TextAlign.End)
+          this.lightFlipChip('水平', 'H', true)
+          this.lightFlipChip('垂直', 'V', false)
+        }
+        .width('100%')
+        .margin({ top: 2 })
+        .alignItems(VerticalAlign.Center)
       }
 
+
+
+      }
+
+      if (this.drawerTab === 1) {
+      Row() {
+        this.headerLabel('质感', 'TEXTURE')
+        Blank()
+        Text(this.t('颗粒 / 光晕', 'GRAIN / HALATION'))
+          .fontSize(7.5)
+          .letterSpacing(0.6)
+          .fontColor(Theme.dim)
+      }
+      .width('100%')
+      .margin({ top: 6 })
+
+      Row() {
+        this.hintLabel('颗粒', 'GRAIN',
+          '胶片颗粒：模拟银盐晶体，中间调最明显',
+          'Film grain: silver-halide texture, strongest in midtones')
+        Slider({ value: this.grain, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+          .selectedColor(Theme.accent)
+          .trackColor(Theme.track)
+          .trackThickness(4)
+          .layoutWeight(1)
+          .onChange((value: number, mode: SliderChangeMode) => {
+            this.leaveOriginal();
+            this.grain = value;
+            if (mode === SliderChangeMode.End) {
+              this.renderPreview();
+            }
+          })
+        Text(Math.round(this.grain).toString())
+          .fontSize(10)
+          .fontColor(Theme.secondary)
+          .width(26)
+          .textAlign(TextAlign.End)
+      }
+      .width('100%')
+      .margin({ top: 2 })
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        this.hintLabel('光晕', 'HALATION',
+          '光晕：高光在片基反射形成的橙红光晕',
+          'Halation: warm glow bleeding around highlights')
+        Slider({ value: this.halation, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+          .selectedColor(Theme.accent)
+          .trackColor(Theme.track)
+          .trackThickness(4)
+          .layoutWeight(1)
+          .onChange((value: number, mode: SliderChangeMode) => {
+            this.leaveOriginal();
+            this.halation = value;
+            if (mode === SliderChangeMode.End) {
+              this.renderPreview();
+            }
+          })
+        Text(Math.round(this.halation).toString())
+          .fontSize(10)
+          .fontColor(Theme.secondary)
+          .width(26)
+          .textAlign(TextAlign.End)
+      }
+      .width('100%')
+      .margin({ top: 2 })
+      .alignItems(VerticalAlign.Center)
+
+      }
+
+      if (this.drawerTab === 2) {
       Row() {
         this.hintLabel('胶片框', 'FRAME MARKS',
           '片边：加上齿孔边框；日期背印：加橙色日期戳',
@@ -2963,9 +4253,9 @@ struct Index {
         Blank()
         Text(this.t('片边', 'EDGE'))
           .fontSize(10)
-          .fontColor(this.filmEdge ? Theme.onSelection : Theme.secondary)
-          .backgroundColor(this.filmEdge ? Theme.selection : Theme.card)
-          .border({ width: 1, color: this.filmEdge ? Theme.selection : Theme.rule })
+          .fontColor(this.filmEdge ? Theme.accent : Theme.secondary)
+          .backgroundColor(this.filmEdge ? Theme.cardRaised : Theme.card)
+          .border({ width: 1, color: this.filmEdge ? Theme.accent : Theme.rule })
           .borderRadius(2)
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .onClick(() => {
@@ -2975,9 +4265,9 @@ struct Index {
           })
         Text(this.t('日期', 'DATE'))
           .fontSize(10)
-          .fontColor(this.dateBack ? Theme.onSelection : Theme.secondary)
-          .backgroundColor(this.dateBack ? Theme.selection : Theme.card)
-          .border({ width: 1, color: this.dateBack ? Theme.selection : Theme.rule })
+          .fontColor(this.dateBack ? Theme.accent : Theme.secondary)
+          .backgroundColor(this.dateBack ? Theme.cardRaised : Theme.card)
+          .border({ width: 1, color: this.dateBack ? Theme.accent : Theme.rule })
           .borderRadius(2)
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .margin({ left: 6 })
@@ -2991,6 +4281,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.drawerTab === 3) {
       Row() {
         this.headerLabel('后期', 'POST-DEV')
         Blank()
@@ -3009,7 +4302,8 @@ struct Index {
         Slider({ value: this.toneContrast, min: -50, max: 50, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -3035,7 +4329,8 @@ struct Index {
         Slider({ value: this.toneSaturation, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -3061,7 +4356,8 @@ struct Index {
         Slider({ value: this.toneBrightness, min: -50, max: 50, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -3087,7 +4383,8 @@ struct Index {
         Slider({ value: this.highlightBoost, min: 0, max: 8, step: 0.1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .enabled(this.currentFilm() === undefined || this.currentFilm()!.type !== 'positive')
           .onChange((value: number, mode: SliderChangeMode) => {
@@ -3114,7 +4411,8 @@ struct Index {
         Slider({ value: this.highlightHeadroom, min: 0, max: 8, step: 0.5, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .enabled(this.currentFilm() === undefined || this.currentFilm()!.type !== 'positive')
           .onChange((value: number, mode: SliderChangeMode) => {
@@ -3154,7 +4452,8 @@ struct Index {
         Slider({ value: this.enlargerY, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -3180,7 +4479,8 @@ struct Index {
         Slider({ value: this.enlargerM, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -3206,7 +4506,8 @@ struct Index {
         Slider({ value: this.enlargerC, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -3233,7 +4534,8 @@ struct Index {
           Slider({ value: this.bwFilter, min: 0, max: 100, step: 1, style: SliderStyle.InSet })
           .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
             .selectedColor(Theme.accent)
-            .trackColor(Theme.rule)
+            .trackColor(Theme.track)
+          .trackThickness(4)
             .layoutWeight(1)
             .onChange((value: number, mode: SliderChangeMode) => {
               this.leaveOriginal();
@@ -3260,7 +4562,8 @@ struct Index {
         Slider({ value: this.couplers, min: 0, max: 150, step: 1, style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
-          .trackColor(Theme.rule)
+          .trackColor(Theme.track)
+          .trackThickness(4)
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
@@ -3279,13 +4582,16 @@ struct Index {
       .margin({ top: 0 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.drawerTab === 4) {
       Row() {
-        this.hintLabel('导出', 'EXPORT',
-          '导出规格：3000 JPEG / 2048 网页 / 1080 社交 / PNG 无损',
-          'Export recipe: 3000 JPEG / 2048 web / 1080 social / lossless PNG')
+        this.headerLabel('导出', 'EXPORT')
       }
       .width('100%')
-      .margin({ top: 6 })
+      .margin({ top: 8, bottom: 6 })
+      .onClick(() => this.hint('导出规格：3000 JPEG / 2048 网页 / 1080 社交 / PNG 无损',
+        'Export recipe: 3000 JPEG / 2048 web / 1080 social / lossless PNG'))
 
       Row() {
         this.recipeChip('3000', 0)
@@ -3296,14 +4602,19 @@ struct Index {
       .width('100%')
       .margin({ top: 2 })
 
+      this.appliedSummary()
+      }
+
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
+        .constraintSize({ minHeight: '100%' })
       }
       .scrollable(ScrollDirection.Vertical)
       .scrollBar(BarState.Off)
       .width('100%')
-      .height(226)
+      .height(238)
+      }
 
       if (this.hasPhoto) {
         Text(this.status)
@@ -3317,6 +4628,8 @@ struct Index {
 
       Row() {
         Button(this.t('选择照片', 'SELECT PHOTO'))
+          .type(ButtonType.Normal)
+          .borderRadius(4)
           .layoutWeight(1)
           .height(40)
           .fontSize(12)
@@ -3324,6 +4637,8 @@ struct Index {
           .backgroundColor(Theme.card)
           .onClick(() => this.pickPhoto())
         Button(this.busy ? this.t('处理中…', 'BUSY…') : this.t('保存成片', 'SAVE PRINT'))
+          .type(ButtonType.Normal)
+          .borderRadius(4)
           .layoutWeight(1)
           .height(40)
           .fontSize(12)
@@ -3339,6 +4654,16 @@ struct Index {
     .width('100%')
     .padding({ left: 10, right: 10, bottom: 12 })
     .backgroundColor(Theme.ground)
+  }
+
+  /** Keep the histogram card inside the canvas so a drag can never lose it. */
+  private clampHist(x: number, y: number): void {
+    const minX: number = -(this.viewW - 10 - this.histCardW);
+    const maxX: number = 10;
+    this.histOffX = Math.min(maxX, Math.max(minX, x));
+    const minY: number = -10;
+    const maxY: number = this.viewH - 10 - this.histCardH;
+    this.histOffY = Math.min(maxY, Math.max(minY, y));
   }
 
   @Builder
@@ -3361,6 +4686,31 @@ struct Index {
       .padding(6)
       .backgroundColor('#E61E1F1E')
       .border({ width: 1, color: Theme.rule })
+      .onAreaChange((_old: Area, area: Area) => {
+        this.histCardW = Number(area.width);
+        this.histCardH = Number(area.height);
+      })
+      // 卡片可整体拖动，避免挡住右上角的灯光位置；Block 让拖动独占，
+      // 不会同时带动底下的画布平移/灯光拖动。
+      .translate({ x: this.histOffX, y: this.histOffY })
+      .hitTestBehavior(HitTestMode.Block)
+      .gesture(
+        PanGesture()
+          .onActionStart((_e: GestureEvent) => {
+            this.histDragBaseX = this.histOffX;
+            this.histDragBaseY = this.histOffY;
+          })
+          .onActionUpdate((e: GestureEvent) => {
+            this.clampHist(this.histDragBaseX + e.offsetX, this.histDragBaseY + e.offsetY);
+          })
+      )
+      .gesture(
+        // 双击归位：把卡片送回右上角默认位置。
+        TapGesture({ count: 2 })
+          .onAction(() => {
+            this.clampHist(0, 0);
+          })
+      )
     }
     .width('100%')
     .height('100%')
@@ -3407,6 +4757,99 @@ struct Index {
     .hitTestBehavior(HitTestMode.Transparent)
   }
 
+  /** 灯光实时叠加层：GPU 合成，和最终烘焙同样是 additive + gain。 */
+  @Builder
+  lightOverlays() {
+    Stack({ alignContent: Alignment.Center }) {
+      ForEach(this.overlayLights(), (l: LightLayer) => {
+        if (l.preset > 0 && l.strength > 0 && l.scale > 0) {
+          Image($rawfile('light/' + this.presetId(l.preset) + '.webp'))
+            .width(this.lightFrameW(l))
+            .height(this.lightFrameH(l))
+            .objectFit(ImageFit.Fill)
+            .colorFilter(lightGainFilter(this.presetGain(l.preset) * Math.min(1.0, l.strength / 100.0)))
+            .blendMode(BlendMode.PLUS)
+            .rotate({ angle: l.rot })
+            .scale({ x: l.flipH ? -1 : 1, y: l.flipV ? -1 : 1 })
+            .translate({
+              x: l.x / 100.0 * this.lightAreaW(),
+              y: l.y / 100.0 * this.lightAreaH()
+            })
+            .hitTestBehavior(HitTestMode.None)
+        }
+      }, (l: LightLayer) => 'ov' + l.id + '-' + l.preset + '-' + l.x + '-' + l.y +
+        '-' + l.scale + '-' + l.rot + '-' + l.strength + '-' + l.flipH + '-' + l.flipV)
+    }
+    .width('100%')
+    .height('100%')
+    .scale({ x: this.zoomK, y: this.zoomK })
+    .translate({ x: this.panX + this.cropDx, y: this.panY + this.cropDy })
+    .hitTestBehavior(HitTestMode.None)
+  }
+
+  /** 画面上的灯位外框：虚线框 + 右上角 ×、右下角旋转键。 */
+  @Builder
+  lightFrameBox(l: LightLayer) {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width(this.lightFrameW(l))
+        .height(this.lightFrameH(l))
+        .borderRadius(3)
+        .border({ width: 1, color: Theme.accent, style: BorderStyle.Dashed })
+        .hitTestBehavior(HitTestMode.None)
+      Text('✕')
+        .fontSize(10)
+        .fontColor('#121212')
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+        .backgroundColor(Theme.accent)
+        .borderRadius(10)
+        .translate({ x: this.frameBtnDx(l), y: -this.frameBtnDy(l) })
+        .onClick(() => this.deleteLightAt(l.id))
+      Text('⟳')
+        .fontSize(11)
+        .fontColor('#121212')
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+        .backgroundColor(Theme.accent)
+        .borderRadius(10)
+        .responseRegion({ x: -12, y: -12, width: 44, height: 44 })
+        .translate({ x: this.frameBtnDx(l), y: this.frameBtnDy(l) })
+        .onClick(() => this.rotateLightAt(l.id))
+        .gesture(
+          PanGesture({ fingers: 1 })
+            .onActionStart(() => this.beginRotateDrag(l.id))
+            .onActionUpdate((e: GestureEvent) => {
+              this.updateRotateDrag(l, e.offsetX, e.offsetY);
+            })
+            .onActionEnd(() => this.endRotateDrag())
+            .onActionCancel(() => this.endRotateDrag())
+        )
+    }
+    .translate({
+      x: l.x / 100.0 * this.lightAreaW(),
+      y: l.y / 100.0 * this.lightAreaH()
+    })
+    .rotate({ angle: this.frameRot(l) })
+    // 外框本身不能吃掉触摸，否则在光斑上按下拖动会被框挡住、看起来像「拖不动」。
+    .hitTestBehavior(HitTestMode.Transparent)
+  }
+
+  @Builder
+  lightFrames() {
+    Stack({ alignContent: Alignment.Center }) {
+      ForEach(this.frameLights(), (l: LightLayer) => {
+        this.lightFrameBox(l)
+      }, (l: LightLayer) => 'lf' + l.id + '-' + l.rot + '-' + l.strength + '-' +
+        l.scale + '-' + l.x + '-' + l.y)
+    }
+    .width('100%')
+    .height('100%')
+    .hitTestBehavior(HitTestMode.Transparent)
+  }
+
   @Builder
   originalBadge() {
     Column() {
@@ -3440,22 +4883,158 @@ struct Index {
             .gesture(
               GestureGroup(GestureMode.Parallel,
                 PinchGesture({ fingers: 2 })
-                  .onActionStart(() => {
+                  .onActionStart((e: GestureEvent) => {
                     this.baseZoom = this.zoomK;
+                    // 画面上有灯时优先缩放灯光：双指捏合改「大小」，和滑杆同一参数。
+                    this.pinchLightOn = this.zoomK <= 1.0 && this.effAspect() <= 0.0 &&
+                      ((this.lightIndex > 0 && this.lightDraft) || this.lightLayers.length > 0);
+                    this.pinchLightType = 0;
+                    this.pinchLayerId = -1;
+                    this.pinchBaseScale = this.lightScale;
+                    if (this.pinchLightOn) {
+                      const s0: number = this.previewScale();
+                      const iw: number = (this.innerW > 0 ? this.innerW : this.previewW) * s0;
+                      const ih: number = (this.innerH > 0 ? this.innerH : this.previewH) * s0;
+                      let mx: number = this.viewW / 2;
+                      let my: number = this.viewH / 2;
+                      if (e.fingerList.length > 0) {
+                        mx = e.fingerList[0].localX;
+                        my = e.fingerList[0].localY;
+                        if (e.fingerList.length > 1) {
+                          mx = (mx + e.fingerList[1].localX) / 2.0;
+                          my = (my + e.fingerList[1].localY) / 2.0;
+                        }
+                      }
+                      const tx: number = mx - this.viewW / 2;
+                      const ty: number = my - this.viewH / 2;
+                      const aw: number = this.lightAreaW();
+                      const ah: number = this.lightAreaH();
+                      // 双指落点必须真的压在某一盏灯上才缩放灯光，否则还给它缩放原图。
+                      let best: number = Number.MAX_VALUE;
+                      let found: boolean = false;
+                      if (this.lightIndex > 0 && this.lightDraft &&
+                        this.insideLight(tx, ty, this.lightX, this.lightY, this.lightScale, aw, ah)) {
+                        best = this.lightDist2(tx, ty, this.lightX, this.lightY, iw, ih);
+                        found = true;
+                      }
+                      for (let i: number = 0; i < this.lightLayers.length; i++) {
+                        const l: LightLayer = this.lightLayers[i];
+                        if (!this.insideLight(tx, ty, l.x, l.y, l.scale, aw, ah)) {
+                          continue;
+                        }
+                        const d: number = this.lightDist2(tx, ty, l.x, l.y, iw, ih);
+                        if (d < best) {
+                          best = d;
+                          found = true;
+                          this.pinchBaseScale = l.scale;
+                          this.pinchLightType = 1;
+                          this.pinchLayerId = l.id;
+                        }
+                      }
+                      this.pinchLightOn = found;
+                      // 单指 Pan 可能比第二根手指先起手，这里把拖灯状态收掉：
+                      // 否则捏合期间外框会被隐藏、还会多画一个拖拽光斑。
+                      if (this.pinchLightOn) {
+                        this.lightDragOn = false;
+                      }
+                    }
                   })
                   .onActionUpdate((e: GestureEvent) => {
-                    this.zoomK = Math.max(1.0, Math.min(8.0, this.baseZoom * e.scale));
+                    if (this.pinchLightOn) {
+                      const sc: number = Math.round(Math.max(10, Math.min(250,
+                        this.pinchBaseScale * e.scale)));
+                      if (this.pinchLightType === 1) {
+                        this.setLayerScale(this.pinchLayerId, sc);
+                      } else {
+                        this.lightDraft = true;
+                        this.lightScale = sc;
+                      }
+                    } else {
+                      this.zoomK = Math.max(1.0, Math.min(8.0, this.baseZoom * e.scale));
+                    }
+                  })
+                  .onActionEnd(() => {
+                    if (this.pinchLightOn) {
+                      this.pinchLightOn = false;
+                      this.afterLightEdit();
+                    }
+                  })
+                  .onActionCancel(() => {
+                    if (this.pinchLightOn) {
+                      this.pinchLightOn = false;
+                      this.afterLightEdit();
+                    }
                   }),
                 PanGesture({ fingers: 1 })
-                  .onActionStart(() => {
+                  .onActionStart((e: GestureEvent) => {
                     this.basePanX = this.panX;
                     this.basePanY = this.panY;
                     this.cropBaseX = this.cropX;
                     this.cropBaseY = this.cropY;
-                    this.lightBaseX = this.lightX;
-                    this.lightBaseY = this.lightY;
-                    this.lightDragging = this.zoomK <= 1.0 && this.lightIndex > 0 &&
-                      this.effAspect() <= 0.0;
+                    // 双指捏合时不进入单指拖灯：捏合期间只看 PinchGesture，否则灯光会跟着
+                    // 其中一根手指跑、外框还会闪。
+                    this.lightDragOn = this.zoomK <= 1.0 && this.effAspect() <= 0.0 &&
+                      e.fingerList.length < 2 &&
+                      ((this.lightIndex > 0 && this.lightDraft) || this.lightLayers.length > 0);
+                    const s0: number = this.previewScale();
+                    const iw: number = (this.innerW > 0 ? this.innerW : this.previewW) * s0;
+                    const ih: number = (this.innerH > 0 ? this.innerH : this.previewH) * s0;
+                    // 按手指落点挑最近的一盏灯：面板这盏和已存图层都能直接拖，
+                    // 不会出现「叠了两盏只有一盏跟着动」。
+                    let baseX: number = this.lightX;
+                    let baseY: number = this.lightY;
+                    let presetIdx: number = this.lightIndex;
+                    let scale: number = this.lightScale;
+                    let strength: number = this.lightStrength;
+                    let rot: number = this.lightRot;
+                    let fh: boolean = this.lightFlipH;
+                    let fv: boolean = this.lightFlipV;
+                    this.lightDragType = 0;
+                    this.lightDragLayerId = -1;
+                    if (this.lightDragOn) {
+                      const tx: number = (e.fingerList.length > 0 ? e.fingerList[0].localX
+                        : this.viewW / 2) - this.viewW / 2;
+                      const ty: number = (e.fingerList.length > 0 ? e.fingerList[0].localY
+                        : this.viewH / 2) - this.viewH / 2;
+                      let best: number = this.lightIndex > 0 && this.lightDraft
+                        ? this.lightDist2(tx, ty, this.lightX, this.lightY, iw, ih)
+                        : Number.MAX_VALUE;
+                      for (let i: number = 0; i < this.lightLayers.length; i++) {
+                        const l: LightLayer = this.lightLayers[i];
+                        const d: number = this.lightDist2(tx, ty, l.x, l.y, iw, ih);
+                        if (d < best) {
+                          best = d;
+                          baseX = l.x;
+                          baseY = l.y;
+                          presetIdx = l.preset;
+                          scale = l.scale;
+                          strength = l.strength;
+                          rot = l.rot;
+                          fh = l.flipH;
+                          fv = l.flipV;
+                          this.lightDragType = 1;
+                          this.lightDragLayerId = l.id;
+                        }
+                      }
+                    }
+                    this.lightBaseX = baseX;
+                    this.lightBaseY = baseY;
+                    this.lightPendingX = baseX;
+                    this.lightPendingY = baseY;
+                    this.lightDrag.x = baseX / 100.0 * iw;
+                    this.lightDrag.y = baseY / 100.0 * ih;
+                    if (this.lightDragOn && presetIdx > 0) {
+                      const preset: LightPreset = LIGHT_PRESETS[presetIdx - 1];
+                      const dw: number = iw * Math.max(0.01, scale / 100.0);
+                      this.lightDrag.src = 'light/' + preset.id + '.webp';
+                      this.lightDrag.w = dw;
+                      this.lightDrag.h = dw / (this.lightAspect > 0 ? this.lightAspect : 1.0);
+                      this.lightDrag.alpha = 1.0;
+                      this.lightDrag.gain = preset.gain * Math.min(1.0, strength / 100.0);
+                      this.lightDrag.rot = rot;
+                      this.lightDrag.flipH = fh;
+                      this.lightDrag.flipV = fv;
+                    }
                   })
                   .onActionUpdate((e: GestureEvent) => {
                     if (this.zoomK > 1.0) {
@@ -3469,17 +5048,17 @@ struct Index {
                       const maxY: number = sh[1] * 2.0 * s;
                       this.cropDx = Math.max(-maxX, Math.min(maxX, e.offsetX));
                       this.cropDy = Math.max(-maxY, Math.min(maxY, e.offsetY));
-                    } else if (this.lightIndex > 0) {
-                      // 选中灯光后，直接在画面上拖动光源：跟手比 1:1。
+                    } else if (this.lightDragOn && !this.pinchLightOn) {
+                      // 选中灯光（或直接抓住已存图层）后，在画面上拖动光源：跟手比 1:1。
                       const s: number = this.previewScale();
-                      const dw: number = this.outW > 0 ? this.outW * s : this.previewW;
-                      const dh: number = this.outH > 0 ? this.outH * s : this.previewH;
-                      this.lightX = Math.max(-100, Math.min(100,
+                      const dw: number = (this.innerW > 0 ? this.innerW : this.previewW) * s;
+                      const dh: number = (this.innerH > 0 ? this.innerH : this.previewH) * s;
+                      this.lightPendingX = Math.max(-50, Math.min(50,
                         this.lightBaseX + e.offsetX / Math.max(1, dw) * 100));
-                      this.lightY = Math.max(-100, Math.min(100,
+                      this.lightPendingY = Math.max(-50, Math.min(50,
                         this.lightBaseY + e.offsetY / Math.max(1, dh) * 100));
-                      this.lightDragX = this.lightX / 100.0 * dw;
-                      this.lightDragY = this.lightY / 100.0 * dh;
+                      this.lightDrag.x = this.lightPendingX / 100.0 * dw;
+                      this.lightDrag.y = this.lightPendingY / 100.0 * dh;
                     }
                   })
                   .onActionEnd(() => {
@@ -3498,33 +5077,53 @@ struct Index {
                       this.cropDx = 0;
                       this.cropDy = 0;
                       this.renderPreview();
-                    } else if (this.zoomK <= 1.0 && this.lightIndex > 0 &&
-                      (this.lightX !== this.lightBaseX || this.lightY !== this.lightBaseY)) {
-                      this.renderPreview();
+                    } else if (this.zoomK <= 1.0 && this.lightDragOn &&
+                      (this.lightPendingX !== this.lightBaseX ||
+                        this.lightPendingY !== this.lightBaseY)) {
+                      if (this.lightDragType === 1) {
+                        const id: number = this.lightDragLayerId;
+                        this.lightLayers = this.lightLayers.map((l: LightLayer) => l.id === id
+                          ? { id: l.id, preset: l.preset, strength: l.strength, scale: l.scale,
+                            x: this.lightPendingX, y: this.lightPendingY,
+                            rot: l.rot, flipH: l.flipH, flipV: l.flipV } as LightLayer
+                          : l);
+                      } else {
+                        this.lightDraft = true;
+                        this.lightX = this.lightPendingX;
+                        this.lightY = this.lightPendingY;
+                      }
+                      // 灯光页签里画面是 UI 叠加层实时合成的，松手只需提交状态，
+                      // 不再等一次 1~2 秒的像素重渲染。
+                      this.afterLightEdit();
+                    } else {
+                      this.lightDragOn = false;
                     }
-                    this.lightDragging = false;
                   })
               )
             )
-            .onClick(() => {
-              this.showOriginal = !this.showOriginal;
-            })
 
-          if (this.lightDragging) {
-            Column()
-              .width(26)
-              .height(26)
-              .borderRadius(13)
-              .border({ width: 1.5, color: Theme.accent })
-              .translate({ x: this.lightDragX, y: this.lightDragY })
-              .hitTestBehavior(HitTestMode.None)
+          if (this.lightLive()) {
+            this.lightOverlays()
           }
+
+          if (this.lightDragOn) {
+            LightHandle({ drag: this.lightDrag })
+          }
+
         } else {
           this.emptyState()
         }
 
         if (this.hasPhoto) {
-          this.histogramOverlay()
+          if (this.showHist) {
+            this.histogramOverlay()
+          }
+          // 每盏灯在所有编辑页签都画出可删除/可旋转的外框；放在直方图之后，
+          // 避免灯位落在右上角时 ✕ / ⟳ 被直方图面板盖住。
+          if (!this.filtersOff && !this.showOriginal && !this.lightDragOn &&
+            this.allLights().length > 0) {
+            this.lightFrames()
+          }
           this.canvasOverlay()
         }
         if (this.showOriginal && this.hasPhoto) {
