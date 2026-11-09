@@ -28,7 +28,7 @@ import { buildExifApp1, insertExif, exifTimestamp } from '../engine/Exif';
 import { IMAGE_SUFFIX_FILTER, OpenedImage, openImageSource } from '../engine/ImageImport';
 
 /** 隐私政策公网地址：静态页部署完成后替换成最终 URL（必须无需登录即可访问）。 */
-const PRIVACY_URL: string = 'https://example.github.io/digitalfilm/privacy.html';
+const PRIVACY_URL: string = 'https://yumdeer.github.io/DigitalFilm/privacy.html';
 const PREF_STORE: string = 'digitalfilm_prefs';
 const PREF_PRIVACY_KEY: string = 'privacy_agreed_v1';
 
