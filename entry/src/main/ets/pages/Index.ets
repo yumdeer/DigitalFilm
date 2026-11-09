@@ -5191,6 +5191,11 @@ struct Index {
                       }
                     } else {
                       this.zoomK = Math.max(1.0, Math.min(8.0, this.baseZoom * e.scale));
+                      if (this.zoomK <= 1.0) {
+                        // 捏合缩回 100% 时同步清掉平移残留，否则图片会卡在偏移位置。
+                        this.panX = 0;
+                        this.panY = 0;
+                      }
                     }
                   })
                   .onActionEnd(() => {
@@ -5351,6 +5356,30 @@ struct Index {
                       this.afterLightEdit();
                     } else {
                       this.lightDragOn = false;
+                    }
+                  })
+                  .onActionCancel(() => {
+                    // 手势被打断时清掉残留偏移，避免图片卡在平移后的位置。
+                    this.wheelOn = false;
+                    this.cropDx = 0;
+                    this.cropDy = 0;
+                    this.lightDragOn = false;
+                  }),
+                TapGesture({ count: 1 })
+                  .onAction(() => {
+                    // 底部面板收起（全屏看图）时，单击图片恢复编辑面板。
+                    if (!this.isWide() && !this.drawerOpen) {
+                      this.drawerOpen = true;
+                      return;
+                    }
+                    // 面板展开时单击画布复位缩放：放大或平移后点一下图片回到 100% 居中。
+                    if (this.zoomK > 1.0 || this.panX !== 0 || this.panY !== 0 ||
+                      this.cropDx !== 0 || this.cropDy !== 0) {
+                      this.zoomK = 1.0;
+                      this.panX = 0;
+                      this.panY = 0;
+                      this.cropDx = 0;
+                      this.cropDy = 0;
                     }
                   })
               )
