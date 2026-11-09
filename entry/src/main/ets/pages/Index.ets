@@ -2473,7 +2473,39 @@ struct Index {
     return sig;
   }
 
-  async renderPreview(): Promise<void> {
+  private lastQuickMs: number = 0;
+  private quickTimerId: number = -1;
+
+  /** 滑动中的低清实时预览入口：150ms 节流；渲染中直接忽略（End 的全量会覆盖）。 */
+  private requestQuickRender(): void {
+    if (this.busy) {
+      return;
+    }
+    const gap: number = Date.now() - this.lastQuickMs;
+    if (gap >= 150) {
+      this.lastQuickMs = Date.now();
+      this.renderPreview(true);
+      return;
+    }
+    if (this.quickTimerId < 0) {
+      this.quickTimerId = setTimeout(() => {
+        this.quickTimerId = -1;
+        if (!this.busy) {
+          this.lastQuickMs = Date.now();
+          this.renderPreview(true);
+        }
+      }, 150 - gap);
+    }
+  }
+
+  private cancelQuickRender(): void {
+    if (this.quickTimerId >= 0) {
+      clearTimeout(this.quickTimerId);
+      this.quickTimerId = -1;
+    }
+  }
+
+  async renderPreview(quick: boolean = false): Promise<void> {
     const src: Uint8Array | undefined = this.previewSrc;
     const film: FilmAssets | undefined = this.currentFilm();
     const paper: PaperAssets | undefined = this.currentPaper();
@@ -2488,8 +2520,13 @@ struct Index {
     this.progress = 0;
     try {
       const gkey: string = this.geoSignature();
+      // 滑动中的低清实时预览：分辨率降到约 1/3（像素量 1/9），绕过全部缓存读写，
+      // 松手后再跑全分辨率，避免污染几何/胶片/调色三层缓存。
+      const quickEdge: number = Math.max(360, Math.round(Math.max(this.previewW, this.previewH) / 3));
       let geo: GeoResult;
-      if (this.geoCacheBuf !== undefined && this.geoCacheKey === gkey) {
+      if (quick) {
+        geo = await this.prepare(src, this.previewW, this.previewH, quickEdge);
+      } else if (this.geoCacheBuf !== undefined && this.geoCacheKey === gkey) {
         geo = { src: this.geoCacheBuf, w: this.geoCacheW, h: this.geoCacheH };
       } else {
         geo = await this.prepare(src, this.previewW, this.previewH, 0);
@@ -2499,7 +2536,7 @@ struct Index {
         this.geoCacheKey = gkey;
       }
       // 原图对比只跟几何有关，拖动灯光时没必要每次重建 PixelMap。
-      if (this.originalKey !== gkey) {
+      if (!quick && this.originalKey !== gkey) {
         await this.refreshOriginalPm(geo);
         this.originalKey = gkey;
       }
@@ -2524,9 +2561,11 @@ struct Index {
         const pairs: FilmLayer[] = this.allFilmPairs();
         const fkey: string = this.filmSignature(pairs, gkey);
         inputSig = fkey;
-        if (this.filmCacheBuf !== undefined && this.filmCacheKey === fkey) {
+        if (!quick && this.filmCacheBuf !== undefined && this.filmCacheKey === fkey) {
           // 只改了灯光/灯位：胶片这一层结果完全一样，直接复用。
-          rendered = this.filmCacheBuf as Uint8Array;
+          // 下游调色的 taskpool 会转移（detach）入参，必须交出副本；
+          // 否则第一次拖调色滑块就会把缓存打挂，之后画面永远不再更新。
+          rendered = (this.filmCacheBuf as Uint8Array).slice();
         } else {
           // 没有胶片层时 geo.src 会被原样交给 taskpool；恒等几何下它就是
           // previewSrc 本体，转移后缓存被 detach，下一次渲染报 detached buffer。
@@ -2534,8 +2573,10 @@ struct Index {
           for (let i = 0; i < pairs.length; i++) {
             rendered = await this.renderFull(rendered, w, h, ev, pairs[i]);
           }
-          this.filmCacheBuf = rendered.slice();
-          this.filmCacheKey = fkey;
+          if (!quick) {
+            this.filmCacheBuf = rendered.slice();
+            this.filmCacheKey = fkey;
+          }
         }
       } else {
         // The meter targets the print's mid-grey, so it only applies to the
@@ -2557,7 +2598,7 @@ struct Index {
           this.toneShadows + '|l|' + this.lutSignature();
         let graded: Uint8Array;
         let gradeCached: boolean = false;
-        if (this.gradeCacheBuf !== undefined && this.gradeCacheKey === gradeKey) {
+        if (!quick && this.gradeCacheBuf !== undefined && this.gradeCacheKey === gradeKey) {
           // 只改了灯光：光晕/散射/暗角/色调/LUT 结果完全一样，整段复用。
           graded = this.gradeCacheBuf;
           gradeCached = true;
@@ -2565,8 +2606,10 @@ struct Index {
           const gp: PostPayload = await this.buildPostPayload(rendered, w, h, tex, false);
           const g: GradeResult = await this.gradeAsync(gp);
           graded = g.pixels;
-          this.gradeCacheBuf = graded;
-          this.gradeCacheKey = gradeKey;
+          if (!quick) {
+            this.gradeCacheBuf = graded;
+            this.gradeCacheKey = gradeKey;
+          }
         }
         // finish 会转移（detach）入参，缓存本体必须留一份。
         const fp: PostPayload = await this.buildPostPayload(graded.slice(), w, h, tex,
@@ -2604,12 +2647,17 @@ struct Index {
       this.displayPm = pm;
       // The lit frame is on screen now, so the drag overlay can go.
       this.lightDragOn = false;
-      this.outW = ow;
-      this.outH = oh;
+      if (!quick) {
+        // 低清实时预览不改写全量状态：输出尺寸、耗时都以全量渲染为准。
+        this.outW = ow;
+        this.outH = oh;
+      }
       this.hist = this.histAcc.slice();
       this.busy = false;
       this.progress = 1;
-      this.status = this.lookName() + ' · EV ' + passEv.toFixed(2) + ' · ' + ms + 'ms';
+      if (!quick) {
+        this.status = this.lookName() + ' · EV ' + passEv.toFixed(2) + ' · ' + ms + 'ms';
+      }
       setTimeout(() => {
         this.drawHist();
       }, 0);
@@ -3907,7 +3955,10 @@ struct Index {
             this.leaveOriginal();
             this.straighten = value;
             if (mode === SliderChangeMode.End) {
+              this.cancelQuickRender();
               this.renderPreview();
+            } else {
+              this.requestQuickRender();
             }
           })
         Text(this.straighten.toFixed(1))
@@ -3934,7 +3985,10 @@ struct Index {
             this.leaveOriginal();
             this.lensCorrection = value;
             if (mode === SliderChangeMode.End) {
+              this.cancelQuickRender();
               this.renderPreview();
+            } else {
+              this.requestQuickRender();
             }
           })
         Text(Math.round(this.lensCorrection).toString())
