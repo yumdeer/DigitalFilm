@@ -445,7 +445,8 @@ struct Index {
   @State lutIndex: number = -1;
   /** Percentage of the filter's own default mix. */
   @State lutStrength: number = 100;
-  @State stackFilm: boolean = true;
+  /** 内置滤镜默认不叠加胶片：选滤镜只上色，不自动套一层胶卷模拟。 */
+  @State stackFilm: boolean = false;
   /** 全部滤镜关闭：回到原图初始状态（不做胶卷/相纸模拟，也不套内置滤镜）。 */
   @State filtersOff: boolean = false;
   /** 撤销栈长度，用来驱动撤销按钮的可用态。 */
@@ -524,7 +525,7 @@ struct Index {
     }
     this.pushUndo();
     this.leaveOriginal();
-    this.commitFilmDraft();
+    // 切换 = 替换：不把上一款胶卷固化成图层
     this.filmIndex = index;
     this.filmDraft = true;
     this.pickMode = 0;
@@ -839,7 +840,7 @@ struct Index {
     }
     this.pushUndo();
     this.leaveOriginal();
-    this.commitLutDraft();
+    // 切换 = 替换：只保留最新这一款草稿，绝不把上一款并进叠加栈
     this.lutIndex = index;
     this.lutDraft = index >= 0 && index < this.filters.length;
     this.renderPreview();
@@ -1313,7 +1314,8 @@ struct Index {
   private removeLightLayer(id: number): void {
     this.pushUndo();
     this.lightLayers = this.lightLayers.filter((l: LightLayer) => l.id !== id);
-    this.renderAfterLayerChange();
+    // 与面板里的 ✕ 一致：叠加层直接消失即可，跳过「快速渲染 + 260ms 全量渲染」两轮
+    this.lightDragOn = false;
   }
 
   /** 把图层取回面板继续调整（取回后不再重复渲染两层）。 */
@@ -1393,7 +1395,10 @@ struct Index {
       if (kind === LAYER_FILM) {
         this.filmDraft = false;
       } else if (kind === LAYER_LIGHT) {
+        // 灯光只存在于叠加层，底层预览从未烘焙灯光，删掉面板这盏不需要重跑像素链
         this.lightDraft = false;
+        this.lightDragOn = false;
+        return;
       } else {
         this.lutDraft = false;
       }
@@ -1526,11 +1531,13 @@ struct Index {
               .fontSize(12)
               .fontColor(Theme.secondary)
               .padding({ left: 8, right: 2, top: 1, bottom: 1 })
+              .id('layerDel_' + row.key)
               .onClick(() => this.removeLayerByKind(row.kind, row.id))
           }
           .width('100%')
           .height(24)
           .alignItems(VerticalAlign.Center)
+          .id('layerRow_' + row.key)
           .onClick(() => this.editLayerFromStack(row))
         }, (row: LayerRow) => row.key)
       }
@@ -1713,6 +1720,10 @@ struct Index {
     this.filmLayers = [];
     this.lutLayers = [];
     this.lightLayers = [];
+    this.filmDraft = false;
+    this.lutDraft = false;
+    this.lightDraft = false;
+    this.lutIndex = -1;
     await this.loadPhoto(uri);
     // 只有拍摄链路明确带了胶卷/相纸才套用；相册导入一律先停留在原图直通。
     if (this.pendingFilmId.length > 0 || this.pendingPaperId.length > 0) {
@@ -4728,6 +4739,7 @@ struct Index {
           'On: film/paper pass then the table; Off: table applied to the source')
         Blank()
         Text(this.stackFilm ? this.t('开', 'ON') : this.t('关', 'OFF'))
+          .id('stackFilmState')
           .fontSize(9)
           .fontColor(Theme.secondary)
           .width(28)
