@@ -389,6 +389,201 @@ export function adjustTone(pixels: Uint8Array, w: number, h: number,
   }
 }
 
+/**
+ * HSL: eight hue bands (red / orange / yellow / green / aqua / blue / purple /
+ * magenta), each carrying hue / saturation / luminance in -100..100.  `bands`
+ * must hold 24 values (8 x 3).  Neighbouring bands are blended with a
+ * triangular falloff so dragging one colour never leaves a hard seam.
+ */
+export function adjustHsl(pixels: Uint8Array, w: number, h: number,
+                          bands: number[]): void {
+  if (bands.length < 24) {
+    return;
+  }
+  let active: boolean = false;
+  for (let i = 0; i < 24; i++) {
+    if (bands[i] > 0.01 || bands[i] < -0.01) {
+      active = true;
+      break;
+    }
+  }
+  if (!active) {
+    return;
+  }
+  const centers: number[] = [0, 30, 60, 120, 180, 240, 285, 330];
+  const hueShift: Float32Array = new Float32Array(360);
+  const satGain: Float32Array = new Float32Array(360);
+  const lumGain: Float32Array = new Float32Array(360);
+  for (let deg = 0; deg < 360; deg++) {
+    let sum: number = 0;
+    let hs: number = 0;
+    let ss: number = 0;
+    let ls: number = 0;
+    for (let b = 0; b < 8; b++) {
+      let d: number = Math.abs(deg - centers[b]);
+      if (d > 180) {
+        d = 360 - d;
+      }
+      let wt: number = 1.0 - d / 45.0;
+      if (wt < 0) {
+        wt = 0;
+      }
+      wt = wt * wt;
+      sum += wt;
+      hs += wt * bands[b * 3];
+      ss += wt * bands[b * 3 + 1];
+      ls += wt * bands[b * 3 + 2];
+    }
+    if (sum > 0) {
+      hs /= sum;
+      ss /= sum;
+      ls /= sum;
+    }
+    hueShift[deg] = hs / 100.0 * 45.0;
+    satGain[deg] = 1.0 + ss / 100.0;
+    lumGain[deg] = 1.0 + ls / 100.0;
+  }
+  const n: number = w * h;
+  for (let p = 0; p < n; p++) {
+    const o: number = p * 4;
+    const r: number = pixels[o] / 255.0;
+    const g: number = pixels[o + 1] / 255.0;
+    const b: number = pixels[o + 2] / 255.0;
+    const mx: number = Math.max(r, Math.max(g, b));
+    const mn: number = Math.min(r, Math.min(g, b));
+    const delta: number = mx - mn;
+    if (delta < 0.0001) {
+      continue;
+    }
+    const lum: number = (mx + mn) * 0.5;
+    let hue: number = 0.0;
+    if (mx === r) {
+      hue = (g - b) / delta;
+    } else if (mx === g) {
+      hue = 2.0 + (b - r) / delta;
+    } else {
+      hue = 4.0 + (r - g) / delta;
+    }
+    hue *= 60.0;
+    if (hue < 0) {
+      hue += 360.0;
+    }
+    let idx: number = Math.round(hue);
+    if (idx >= 360) {
+      idx = 0;
+    }
+    let sat: number = delta / (1.0 - Math.abs(2.0 * lum - 1.0));
+    if (sat < 0) {
+      sat = 0;
+    }
+    if (sat > 1) {
+      sat = 1;
+    }
+    let h2: number = hue + hueShift[idx];
+    if (h2 < 0) {
+      h2 += 360.0;
+    }
+    if (h2 >= 360.0) {
+      h2 -= 360.0;
+    }
+    sat = sat * satGain[idx];
+    if (sat < 0) {
+      sat = 0;
+    }
+    if (sat > 1) {
+      sat = 1;
+    }
+    let l2: number = lum * lumGain[idx];
+    if (l2 < 0) {
+      l2 = 0;
+    }
+    if (l2 > 1) {
+      l2 = 1;
+    }
+    const q: number = l2 < 0.5 ? l2 * (1.0 + sat) : l2 + sat - l2 * sat;
+    const pch: number = 2.0 * l2 - q;
+    pixels[o] = clamp255(hue2rgb(pch, q, h2 / 360.0 + 1.0 / 3.0) * 255.0);
+    pixels[o + 1] = clamp255(hue2rgb(pch, q, h2 / 360.0) * 255.0);
+    pixels[o + 2] = clamp255(hue2rgb(pch, q, h2 / 360.0 - 1.0 / 3.0) * 255.0);
+  }
+}
+
+function hue2rgb(p: number, q: number, t: number): number {
+  let tt: number = t;
+  if (tt < 0) {
+    tt += 1;
+  }
+  if (tt > 1) {
+    tt -= 1;
+  }
+  if (tt < 1.0 / 6.0) {
+    return p + (q - p) * 6.0 * tt;
+  }
+  if (tt < 0.5) {
+    return q;
+  }
+  if (tt < 2.0 / 3.0) {
+    return p + (q - p) * (2.0 / 3.0 - tt) * 6.0;
+  }
+  return p;
+}
+
+/**
+ * Chromatic dispersion: red is sampled slightly outside and blue slightly
+ * inside the frame, green stays put.  `amount` is -1..1; positive spreads
+ * red outward (classic lateral CA look).
+ */
+export function addDispersion(pixels: Uint8Array, w: number, h: number,
+                             amount: number): void {
+  if (amount > -0.005 && amount < 0.005) {
+    return;
+  }
+  const src: Uint8Array = pixels.slice();
+  const k: number = amount * 0.006;
+  const cx: number = (w - 1) * 0.5;
+  const cy: number = (h - 1) * 0.5;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o: number = (y * w + x) * 4;
+      pixels[o] = sampleChannel(src, w, h, cx + (x - cx) * (1.0 + k),
+        cy + (y - cy) * (1.0 + k), 0);
+      pixels[o + 2] = sampleChannel(src, w, h, cx + (x - cx) * (1.0 - k),
+        cy + (y - cy) * (1.0 - k), 2);
+    }
+  }
+}
+
+function sampleChannel(src: Uint8Array, w: number, h: number,
+                       fx: number, fy: number, ch: number): number {
+  let x0: number = Math.floor(fx);
+  let y0: number = Math.floor(fy);
+  let tx: number = fx - x0;
+  let ty: number = fy - y0;
+  if (x0 < 0) {
+    x0 = 0;
+    tx = 0;
+  }
+  if (x0 >= w) {
+    x0 = w - 1;
+    tx = 0;
+  }
+  if (y0 < 0) {
+    y0 = 0;
+    ty = 0;
+  }
+  if (y0 >= h) {
+    y0 = h - 1;
+    ty = 0;
+  }
+  const x1: number = x0 + 1 < w ? x0 + 1 : w - 1;
+  const y1: number = y0 + 1 < h ? y0 + 1 : h - 1;
+  const a: number = src[(y0 * w + x0) * 4 + ch];
+  const b: number = src[(y0 * w + x1) * 4 + ch];
+  const c: number = src[(y1 * w + x0) * 4 + ch];
+  const d: number = src[(y1 * w + x1) * 4 + ch];
+  return clamp255((a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty);
+}
+
 
 function blendPx(pixels: Uint8Array, o: number, r: number, g: number, b: number, a: number): void {
   const k: number = a < 0 ? 0 : (a > 1 ? 1 : a);
@@ -936,11 +1131,15 @@ export function addDateBack(pixels: Uint8Array, w: number, h: number,
     total += (text.charAt(i) === ' ') ? space : dw + gap;
   }
   const margin: number = Math.max(6, Math.round(Math.min(w, h) * 0.035));
-  let x: number = w - margin - total;
+  // 日期戳整体略向左收，避免贴右边太紧。
+  const rightInset: number = margin + Math.round(Math.min(w, h) * 0.025);
+  // 日期戳同时略向上抬，避免紧贴画布底边。
+  const lift: number = Math.round(Math.min(w, h) * 0.025);
+  let x: number = w - rightInset - total;
   if (x < 2) {
     x = 2;
   }
-  const y: number = h - bottomInset - margin - dh;
+  const y: number = h - bottomInset - margin - lift - dh;
   const cr: number = 255;
   const cg: number = 122;
   const cb: number = 32;
@@ -1116,4 +1315,36 @@ export function applyLightLayer(pixels: Uint8Array, w: number, h: number,
       }
     }
   }
+}
+
+
+/**
+ * 纯白背景白边：把照片按 scale（0.4..1.0）缩放在白底画布中央。
+ * 画布尺寸 = 照片尺寸 / scale，白边在四周对称留出，照片本身不重采样。
+ */
+export function addWhiteMargin(pixels: Uint8Array, w: number, h: number,
+                               scale: number): EdgeResult {
+  if (scale <= 0.05 || scale > 1.0) {
+    return { pixels: pixels, w: w, h: h, band: 0 };
+  }
+  const cw: number = Math.max(w, Math.round(w / scale));
+  const ch: number = Math.max(h, Math.round(h / scale));
+  const out: Uint8Array = new Uint8Array(cw * ch * 4);
+  // 纯白底，alpha 不透明。
+  for (let i = 0; i < out.length; i += 4) {
+    out[i] = 255;
+    out[i + 1] = 255;
+    out[i + 2] = 255;
+    out[i + 3] = 255;
+  }
+  const ox: number = Math.floor((cw - w) / 2);
+  const oy: number = Math.floor((ch - h) / 2);
+  for (let y = 0; y < h; y++) {
+    const srcRow: number = y * w * 4;
+    const dstRow: number = ((y + oy) * cw + ox) * 4;
+    for (let x = 0; x < w * 4; x++) {
+      out[dstRow + x] = pixels[srcRow + x];
+    }
+  }
+  return { pixels: out, w: cw, h: ch, band: 0 };
 }

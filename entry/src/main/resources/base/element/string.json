@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "SpektraLab"
+    },
+    {
+      "name": "camera_reason",
+      "value": "用于取景与拍摄照片（仅在本机处理，不上传）"
     }
   ]
 }

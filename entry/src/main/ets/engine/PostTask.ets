@@ -2,9 +2,10 @@
  * Task-pool wrapper for the display-space post chain (see PostProcess).
  */
 
-import { addHalationGlare, addScatter, addVignette, adjustTone, addFilmEdge,
-  addDateBack, convertP3ToSrgb, applyColorLut, composeFilmEdge, composeMediumEdge,
-  applyLightLayer, EdgeResult } from './PostProcess';
+import { addHalationGlare, addScatter, addVignette, adjustTone, adjustHsl,
+  addDispersion, addFilmEdge, addDateBack, convertP3ToSrgb, applyColorLut,
+  composeFilmEdge, composeMediumEdge, applyLightLayer, addWhiteMargin,
+  EdgeResult } from './PostProcess';
 
 export interface PostPayload {
   pixels: Uint8Array;
@@ -19,6 +20,10 @@ export interface PostPayload {
   brightness: number;
   highlights: number;
   shadows: number;
+  /** HSL 八色相带参数（24 个值，见 adjustHsl）。 */
+  hsl?: number[];
+  /** 色散强度 -1..1。 */
+  dispersion?: number;
   edgeMode: number;
   /** Optional stock artwork (RGBA) that carries the real edge print. */
   edgeTex?: Uint8Array;
@@ -33,6 +38,8 @@ export interface PostPayload {
   luts: PostLut[];
   /** Light layers, added in order on top of the print. */
   lights: PostLight[];
+  /** 纯白背景比例 0.4..1.0；缺省/0 表示不加白边。 */
+  whiteScale?: number;
 }
 
 /** One built-in filter table and its mix strength (0..1). */
@@ -79,6 +86,12 @@ export function postTask(p: PostPayload): PostResult {
   addVignette(px, p.w, p.h, p.vignette);
   const t3: number = Date.now();
   adjustTone(px, p.w, p.h, p.contrast, p.saturation, p.brightness, p.highlights, p.shadows);
+  if (p.hsl !== undefined) {
+    adjustHsl(px, p.w, p.h, p.hsl);
+  }
+  if (p.dispersion !== undefined) {
+    addDispersion(px, p.w, p.h, p.dispersion);
+  }
   convertP3ToSrgb(px, p.w, p.h);
   // The built-in filters grade the finished print, so the tables are read
   // after the display-space conversion and before the frame decoration.
@@ -119,6 +132,12 @@ export function postTask(p: PostPayload): PostResult {
   if (p.dateBack) {
     addDateBack(px, w, h, p.dateText, edge.band);
   }
+  if (p.whiteScale !== undefined && p.whiteScale > 0.05 && p.whiteScale <= 1.0) {
+    const wm: EdgeResult = addWhiteMargin(px, w, h, p.whiteScale);
+    px = wm.pixels;
+    w = wm.w;
+    h = wm.h;
+  }
   const t5: number = Date.now();
   return {
     pixels: px,
@@ -153,6 +172,12 @@ export function gradeTask(p: PostPayload): GradeResult {
   addVignette(px, p.w, p.h, p.vignette);
   const t3: number = Date.now();
   adjustTone(px, p.w, p.h, p.contrast, p.saturation, p.brightness, p.highlights, p.shadows);
+  if (p.hsl !== undefined) {
+    adjustHsl(px, p.w, p.h, p.hsl);
+  }
+  if (p.dispersion !== undefined) {
+    addDispersion(px, p.w, p.h, p.dispersion);
+  }
   convertP3ToSrgb(px, p.w, p.h);
   for (let i = 0; i < p.luts.length; i++) {
     const L: PostLut = p.luts[i];
@@ -194,11 +219,20 @@ export function finishTask(p: PostPayload): PostResult {
   } else {
     edge = addFilmEdge(px, p.w, p.h, p.edgeMode);
   }
+  let fx: Uint8Array = edge.pixels;
+  let fw: number = edge.w;
+  let fh: number = edge.h;
   if (p.dateBack) {
-    addDateBack(edge.pixels, edge.w, edge.h, p.dateText, edge.band);
+    addDateBack(fx, fw, fh, p.dateText, edge.band);
+  }
+  if (p.whiteScale !== undefined && p.whiteScale > 0.05 && p.whiteScale <= 1.0) {
+    const wm: EdgeResult = addWhiteMargin(fx, fw, fh, p.whiteScale);
+    fx = wm.pixels;
+    fw = wm.w;
+    fh = wm.h;
   }
   return {
-    pixels: edge.pixels, w: edge.w, h: edge.h,
+    pixels: fx, w: fw, h: fh,
     stageMs: 'lights=' + (t1 - t0) + ' edge=' + (Date.now() - t1)
   };
 }

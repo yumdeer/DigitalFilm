@@ -58,13 +58,13 @@ interface PaperJson {
   paired_film: string;
 }
 
-interface ManifestFilm {
+export interface ManifestFilm {
   id: string;
   name: string;
   targetPrint: string;
 }
 
-interface ManifestPaper {
+export interface ManifestPaper {
   id: string;
   name: string;
   pairedFilm: string;

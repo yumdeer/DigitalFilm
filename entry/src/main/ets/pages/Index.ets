@@ -1,74 +1,37 @@
 import { image } from '@kit.ImageKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
-import { fileUri } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { resourceManager } from '@kit.LocalizationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { colorSpaceManager, drawing } from '@kit.ArkGraphics2D';
-import { promptAction, window } from '@kit.ArkUI';
-import { preferences } from '@kit.ArkData';
+import { promptAction, router, window } from '@kit.ArkUI';
 import {
-  loadManifest, loadFilm, loadPaper, renderPixels, centerWeightedEv, meterEv,
+  loadManifest, loadFilm, loadPaper, centerWeightedEv, meterEv,
   loadFilterCatalog, loadFilterLut,
   Manifest, FilmAssets, PaperAssets, FilterEntry
 } from '../engine/SpectralEngine';
 import { Theme } from '../common/Theme';
-import { addGrain, addHalationGlare, addScatter, addVignette, adjustTone, addFilmEdge,
-  composeFilmEdge, composeMediumEdge, EdgeResult,
-  addDateBack, convertP3ToSrgb, applyColorLut, applyLightLayer } from '../engine/PostProcess';
+import { FILM_ART_STOCKS, filmTint, filmFlags,
+  filmBrand as catalogBrand, filmIso as catalogIso,
+  isCineFilm as catalogCine } from '../common/FilmCatalog';
+import { addHalationGlare, addScatter, addVignette, adjustTone, adjustHsl,
+  addDispersion, addFilmEdge, composeFilmEdge, composeMediumEdge, EdgeResult,
+  addDateBack, convertP3ToSrgb, applyColorLut, applyLightLayer,
+  addWhiteMargin } from '../engine/PostProcess';
 import { postTask, gradeTask, finishTask, GradeResult, PostPayload, PostResult, PostLight,
   PostLut } from '../engine/PostTask';
 import { taskpool } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { renderSlice, SlicePayload } from '../engine/RenderTask';
+import { renderFilm, grainGainFor, FilmRenderParams } from '../engine/FilmRender';
 import { rotate90, straighten, flip, correctLens, resizeBox, GeoResult } from '../engine/Geometry';
 import { geometryTask, GeometryPayload } from '../engine/GeoTask';
 import { buildExifApp1, insertExif, exifTimestamp } from '../engine/Exif';
 import { IMAGE_SUFFIX_FILTER, OpenedImage, openImageSource } from '../engine/ImageImport';
+import { saveToAlbum } from '../engine/AlbumExport';
+import { PRIVACY_URL, PRIVACY_BODY_ZH, readPrivacyAgreed, writePrivacyAgreed } from '../common/Privacy';
 
 /** 隐私政策公网地址：静态页部署完成后替换成最终 URL（必须无需登录即可访问）。 */
-const PRIVACY_URL: string = 'https://yumdeer.github.io/DigitalFilm/privacy.html';
-const PREF_STORE: string = 'digitalfilm_prefs';
-const PREF_PRIVACY_KEY: string = 'privacy_agreed_v1';
-
-function sleep(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(() => resolve(), ms);
-  });
-}
-
-function filmTint(id: string): string {
-  if (id.indexOf('portra_400') >= 0) { return '#C89A78'; }
-  if (id.indexOf('portra_160') >= 0) { return '#D2AC92'; }
-  if (id.indexOf('portra_800') >= 0) { return '#B98A6B'; }
-  if (id.indexOf('ektar') >= 0) { return '#C4523E'; }
-  if (id.indexOf('gold') >= 0) { return '#D9A441'; }
-  if (id.indexOf('ultramax') >= 0) { return '#C88A4A'; }
-  if (id.indexOf('400h') >= 0) { return '#A6BAAE'; }
-  if (id.indexOf('c200') >= 0) { return '#C9B48F'; }
-  if (id.indexOf('250d') >= 0) { return '#8FA3B8'; }
-  if (id.indexOf('500t') >= 0) { return '#6E7F96'; }
-  if (id.indexOf('50d') >= 0) { return '#9CB3C6'; }
-  if (id.indexOf('200t') >= 0) { return '#7E8FA6'; }
-  if (id.indexOf('verita') >= 0) { return '#8C9DB0'; }
-  if (id.indexOf('cinestill') >= 0) { return '#B4544A'; }
-  if (id.indexOf('xtra') >= 0) { return '#C4B08A'; }
-  if (id.indexOf('push') >= 0) { return '#B49A78'; }
-  if (id.indexOf('hp5') >= 0) { return '#A8B2A2'; }
-  if (id.indexOf('tmax') >= 0) { return '#7C7C78'; }
-  if (id.indexOf('acros') >= 0) { return '#8E9A8C'; }
-  return '#9A9A96';
-}
-
-function filmFlags(f: FilmAssets): string {
-  if (f.type === 'positive') { return 'SLIDE  POSITIVE'; }
-  if (f.channelModel === 'bw') { return 'B&W  NEGATIVE'; }
-  if (f.id.indexOf('vision3') >= 0 || f.id.indexOf('verita') >= 0) {
-    return 'CINE  NEGATIVE';
-  }
-  return 'COLOR  NEGATIVE';
-}
 
 function paperTint(id: string): string {
   if (id.indexOf('crystal') >= 0) { return '#E8E1CE'; }
@@ -116,6 +79,13 @@ interface PaperGroup {
   title: string;
   hint: string;
   papers: PaperAssets[];
+}
+
+/** 相机页跳转编辑页时携带的参数。 */
+interface EditorParams {
+  uri?: string;
+  film?: string;
+  paper?: string;
 }
 
 /** Decoded light-effect sprite (opaque black-background light map). */
@@ -188,6 +158,13 @@ const LAYER_FILM: number = 0;
 const LAYER_LIGHT: number = 1;
 const LAYER_LUT: number = 2;
 
+/** HSL 八色相带的名称与色标，与 adjustHsl 的 8 x 3 参数一一对应。 */
+const HSL_BAND_NAMES: string[] = ['红', '橙', '黄', '绿', '青', '蓝', '紫', '品'];
+const HSL_BAND_NAMES_EN: string[] = ['RED', 'ORANGE', 'YELLOW', 'GREEN',
+  'AQUA', 'BLUE', 'PURPLE', 'MAGENTA'];
+const HSL_BAND_COLORS: string[] = ['#D9534F', '#E08A3C', '#D8C13A', '#5DAE5A',
+  '#4FB7B0', '#4A7FD1', '#8E6BC4', '#C45B9B'];
+
 /** 叠加列表的一行（各 kind 归一化后的展示数据）。 */
 interface LayerRow {
   key: string;
@@ -205,20 +182,6 @@ interface EdgeTexture {
   /** px/mm of the 120 backing-paper strip; 0 means the 135 aperture artwork. */
   ppm: number;
 }
-
-/** Stocks that ship a rendered 135 cartridge / 120 roll illustration. */
-const FILM_ART_STOCKS: string[] = [
-  'kodak_portra_160', 'kodak_portra_400', 'kodak_portra_800',
-  'kodak_portra_800_push1', 'kodak_portra_800_push2',
-  'kodak_ektar_100', 'kodak_gold_200', 'kodak_ultramax_400',
-  'kodak_ektachrome_100', 'kodak_kodachrome_64', 'kodak_verita_200d',
-  'kodak_vision3_50d', 'kodak_vision3_250d', 'kodak_vision3_200t',
-  'kodak_vision3_500t',
-  'fujifilm_c200', 'fujifilm_xtra_400', 'fujifilm_pro_400h',
-  'fujifilm_velvia_100', 'fujifilm_provia_100f',
-  'cinestill_800t', 'ilford_hp5_plus_400', 'kodak_tmax_100',
-  'fujifilm_neopan_acros_100_ii'
-];
 
 /** Stocks whose 120 backing-paper rails ship with the reference assets. */
 const RAIL_STOCKS: string[] = [
@@ -253,6 +216,8 @@ interface FilterSnap {
   toneShadows: number;
   filmEdge: boolean;
   dateBack: boolean;
+  whiteEdge: boolean;
+  whiteScale: number;
   rotation: number;
   flipH: boolean;
   flipV: boolean;
@@ -263,6 +228,8 @@ interface FilterSnap {
   cropX: number;
   cropY: number;
   ev: number;
+  hslBands: number[];
+  dispersion: number;
   lightIndex: number;
   lightStrength: number;
   lightScale: number;
@@ -358,6 +325,9 @@ struct Index {
   @State paperIndex: number = 0;
   /** 0 closed, 1 film library, 2 paper library. */
   @State pickMode: number = 0;
+  private pendingUri: string = '';
+  private pendingFilmId: string = '';
+  private pendingPaperId: string = '';
   /** 首次启动的隐私政策弹窗：用户同意前不加载任何素材、不读写相册。 */
   @State privacyPending: boolean = false;
   @State ev: number = 0;
@@ -368,7 +338,7 @@ struct Index {
   @State status: string = '';
   @State hasPhoto: boolean = false;
   @State meta: string = '';
-  @State drawerOpen: boolean = true;
+  @State drawerOpen: boolean = false;
   // Matches the reference default (grain 1 of its 0…2 range). Our per-unit
   // amplitude is lighter than the reference, so 50 lands at the same noise.
   @State grain: number = 50;
@@ -420,6 +390,9 @@ struct Index {
   @State lensCorrection: number = 0;
   @State filmEdge: boolean = false;
   @State dateBack: boolean = false;
+  /** 输出白边：纯白背景 + 照片缩放（默认 80%）。 */
+  @State whiteEdge: boolean = false;
+  @State whiteScale: number = 0.8;
   @State recipe: number = 0;
   @State aspect: number = 0;
   @State aspectId: string = 'full';
@@ -432,8 +405,16 @@ struct Index {
   @State lang: string = 'zh';
   /** 0 = the film pipeline (膠卷), 1 = the built-in colour filters. */
   @State filterTab: number = 0;
-  /** 场景分页：0 胶片 / 1 光学 / 2 构图 / 3 调色 / 4 输出。 */
+  /** 顶层分页：0 图片 / 1 滤镜 / 2 重构 / 3 调整 / 4 图层。 */
   @State drawerTab: number = 0;
+  /** 调整子页：0 光效 / 1 色彩 / 2 HSL / 3 色调 / 4 特效 / 5 色散 / 6 质感 / 7 暗角。 */
+  @State adjustTab: number = 0;
+  /** HSL 八色相带 × (色相/饱和/明度)，共 24 个值。 */
+  @State hslBands: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  @State hslBand: number = 0;
+  /** 色散：-100..100，正值向外扩散，负值向内收拢。 */
+  @State dispersion: number = 0;
   @State filters: FilterEntry[] = [];
   /** Index into filters, -1 means no table on top of the print. */
   @State lutIndex: number = -1;
@@ -525,10 +506,23 @@ struct Index {
     this.renderPreview();
   }
 
+  /** 删除/取回图层：先低清出图让点击即时响应，再补一次全分辨率。 */
+  private renderAfterLayerChange(): void {
+    this.cancelQuickRender();
+    this.renderPreview(true);
+    setTimeout(() => {
+      if (this.busy) {
+        this.pendingRender = true;
+      } else {
+        this.renderPreview(false);
+      }
+    }, 260);
+  }
+
   private removeFilmLayer(id: number): void {
     this.pushUndo();
     this.filmLayers = this.filmLayers.filter((l: FilmLayer) => l.id !== id);
-    this.renderPreview();
+    this.renderAfterLayerChange();
   }
 
   private editFilmLayer(id: number): void {
@@ -657,6 +651,7 @@ struct Index {
       toneSaturation: this.toneSaturation, toneBrightness: this.toneBrightness,
       toneHighlights: this.toneHighlights, toneShadows: this.toneShadows,
       filmEdge: this.filmEdge, dateBack: this.dateBack,
+      whiteEdge: this.whiteEdge, whiteScale: this.whiteScale,
       lightIndex: this.lightIndex, lightStrength: this.lightStrength,
       lightScale: this.lightScale, lightX: this.lightX, lightY: this.lightY,
       lightRot: this.lightRot, lightFlipH: this.lightFlipH, lightFlipV: this.lightFlipV,
@@ -667,7 +662,8 @@ struct Index {
       rotation: this.rotation, flipH: this.flipH, flipV: this.flipV,
       lensCorrection: this.lensCorrection, straighten: this.straighten,
       aspect: this.aspect, aspectId: this.aspectId,
-      cropX: this.cropX, cropY: this.cropY, ev: this.ev
+      cropX: this.cropX, cropY: this.cropY, ev: this.ev,
+      hslBands: this.hslBands.slice(), dispersion: this.dispersion
     };
   }
 
@@ -716,6 +712,8 @@ struct Index {
     this.toneShadows = s.toneShadows;
     this.filmEdge = s.filmEdge;
     this.dateBack = s.dateBack;
+    this.whiteEdge = s.whiteEdge;
+    this.whiteScale = s.whiteScale;
     this.rotation = s.rotation;
     this.flipH = s.flipH;
     this.flipV = s.flipV;
@@ -726,6 +724,8 @@ struct Index {
     this.cropX = s.cropX;
     this.cropY = s.cropY;
     this.ev = s.ev;
+    this.hslBands = s.hslBands.slice();
+    this.dispersion = s.dispersion;
     this.cropDx = 0;
     this.cropDy = 0;
     this.undoCount = this.undoStack.length;
@@ -758,8 +758,13 @@ struct Index {
     this.toneBrightness = 0;
     this.toneHighlights = 0;
     this.toneShadows = 0;
+    this.hslBands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    this.dispersion = 0;
     this.filmEdge = false;
     this.dateBack = false;
+    this.whiteEdge = false;
+    this.whiteScale = 0.8;
     this.rotation = 0;
     this.flipH = false;
     this.flipV = false;
@@ -854,7 +859,34 @@ struct Index {
   private setDrawerTab(index: number): void {
     if (this.drawerTab !== index) {
       this.drawerTab = index;
+      this.drawerOpen = true;
+      // 进入「滤镜」入口时默认展示胶卷选择。
+      if (index === 0) {
+        this.filterTab = 0;
+      }
+    } else if (!this.isWide()) {
+      // 再次点击当前入口：收起调整面板，只留底部导航（泼辣同款交互）。
+      this.drawerOpen = !this.drawerOpen;
+      if (this.drawerOpen && index === 0) {
+        this.filterTab = 0;
+      }
     }
+  }
+
+  /** 读取某个色相带的色相/饱和/明度（kind 0/1/2）。 */
+  private hslVal(band: number, kind: number): number {
+    const i: number = band * 3 + kind;
+    return i >= 0 && i < this.hslBands.length ? this.hslBands[i] : 0;
+  }
+
+  private setHsl(band: number, kind: number, value: number): void {
+    const i: number = band * 3 + kind;
+    if (i < 0 || i >= this.hslBands.length) {
+      return;
+    }
+    const next: number[] = this.hslBands.slice();
+    next[i] = value;
+    this.hslBands = next;
   }
 
   /** 双指落点是否落在某一盏灯的范围内（判断捏合是缩灯还是缩图）。 */
@@ -1079,7 +1111,7 @@ struct Index {
   private removeLightLayer(id: number): void {
     this.pushUndo();
     this.lightLayers = this.lightLayers.filter((l: LightLayer) => l.id !== id);
-    this.afterLightEdit();
+    this.renderAfterLayerChange();
   }
 
   /** 把图层取回面板继续调整（取回后不再重复渲染两层）。 */
@@ -1105,7 +1137,7 @@ struct Index {
   private removeLutLayer(id: number): void {
     this.pushUndo();
     this.lutLayers = this.lutLayers.filter((l: LutLayer) => l.id !== id);
-    this.renderPreview();
+    this.renderAfterLayerChange();
   }
 
   private editLutLayer(id: number): void {
@@ -1162,7 +1194,7 @@ struct Index {
       } else {
         this.lutDraft = false;
       }
-      this.renderPreview();
+      this.renderAfterLayerChange();
       return;
     }
     if (kind === LAYER_FILM) {
@@ -1217,17 +1249,17 @@ struct Index {
     if (this.filmDraft && this.filmIndex >= 0 && this.filmIndex < this.films.length) {
       rows.push({ key: 'live-f', id: -1, kind: LAYER_FILM,
         title: this.filmPairName({ id: -1, film: this.filmIndex, paper: this.paperIndex }),
-        detail: this.t('调整中', 'LIVE') });
+        detail: this.t('当前', 'CURRENT') });
     }
     if (this.lightDraft && this.lightIndex > 0 && this.lightStrength > 0) {
       rows.push({ key: 'live-l', id: -1, kind: LAYER_LIGHT,
-        title: this.presetName(this.lightIndex), detail: this.t('调整中', 'LIVE') });
+        title: this.presetName(this.lightIndex), detail: this.t('当前', 'CURRENT') });
     }
     if (this.lutDraft && this.lutIndex >= 0 && this.lutIndex < this.filters.length) {
       const lf: FilterEntry | undefined = this.filters[this.lutIndex];
       rows.push({ key: 'live-t', id: -1, kind: LAYER_LUT,
         title: lf === undefined ? '' : this.t(lf.name, lf.nameEn),
-        detail: this.t('调整中', 'LIVE') });
+        detail: this.t('当前', 'CURRENT') });
     }
     rows.sort((x: LayerRow, y: LayerRow) => x.id < 0 ? 1 : (y.id < 0 ? -1 : x.id - y.id));
     return rows;
@@ -1241,7 +1273,7 @@ struct Index {
       this.setDrawerTab(0);
       this.filterTab = 1;
     } else {
-      this.setDrawerTab(5);
+      this.setDrawerTab(3);
     }
     if (row.id >= 0) {
       this.editLayerByKind(row.kind, row.id);
@@ -1364,6 +1396,8 @@ struct Index {
   private pinchLightType: number = 0;
   private pinchLayerId: number = -1;
   private pinchBaseScale: number = 45;
+  private pinchWhiteOn: boolean = false;
+  private pinchBaseWhite: number = 0.8;
   private basePanX: number = 0;
   /** 拖动目标：0 = 面板正在调的那盏，1 = 已存灯光图层。 */
   private lightDragType: number = 0;
@@ -1408,9 +1442,55 @@ struct Index {
     new CanvasRenderingContext2D(new RenderingContextSettings(true));
 
   aboutToAppear(): void {
-    this.drawerOpen = true;
+    this.readIncoming();
     this.checkPrivacy();
     this.setupWindow();
+  }
+
+  /** 相机页通过 router 带照片进来：URI + 当前胶卷/相纸。 */
+  private readIncoming(): void {
+    try {
+      const raw: Object | undefined = router.getParams() as Object | undefined;
+      if (raw === undefined) {
+        return;
+      }
+      const p: EditorParams = raw as EditorParams;
+      if (p.uri !== undefined && p.uri.length > 0) {
+        this.pendingUri = p.uri;
+        this.pendingFilmId = p.film !== undefined ? p.film : '';
+        this.pendingPaperId = p.paper !== undefined ? p.paper : '';
+      }
+    } catch (e) {
+      hilog.warn(0x0000, 'digitalfilm', 'readIncoming failed');
+    }
+  }
+
+  /** 素材就绪后再载入相机带来的照片，并按当前胶卷预设冲印。 */
+  private async applyIncoming(): Promise<void> {
+    if (this.pendingUri.length === 0) {
+      return;
+    }
+    const uri: string = this.pendingUri;
+    this.pendingUri = '';
+    if (this.pendingFilmId.length > 0) {
+      const fi: number = this.films.findIndex((f: FilmAssets) => f.id === this.pendingFilmId);
+      if (fi >= 0) {
+        this.filmIndex = fi;
+      }
+    }
+    if (this.pendingPaperId.length > 0) {
+      const pi: number = this.papers.findIndex((p: PaperAssets) => p.id === this.pendingPaperId);
+      if (pi >= 0) {
+        this.paperIndex = pi;
+      }
+    }
+    this.filmLayers = [];
+    this.lutLayers = [];
+    this.lightLayers = [];
+    await this.loadPhoto(uri);
+    this.filtersOff = false;
+    this.filmDraft = true;
+    await this.renderPreview();
   }
 
   /** 断点判定：返回当前窗口宽度所属档位。 */
@@ -1440,7 +1520,7 @@ struct Index {
       return 238;
     }
     const h: number = this.sideH > 0 ? this.sideH : (this.winH > 0 ? this.winH : 800);
-    const reserved: number = this.drawerTab === 3 ? 210 : 170;
+    const reserved: number = this.drawerTab === 2 ? 246 : 170;
     return Math.max(180, h - reserved);
   }
 
@@ -1506,8 +1586,7 @@ struct Index {
 
   /** 读取本地记录的同意状态：没同意过就先弹隐私政策，同意后再加载素材。 */
   private checkPrivacy(): void {
-    preferences.getPreferences(getContext(this), PREF_STORE).then((pref: preferences.Preferences) => {
-      const agreed: boolean = pref.getSync(PREF_PRIVACY_KEY, false) as boolean;
+    readPrivacyAgreed(getContext(this)).then((agreed: boolean) => {
       if (agreed) {
         this.initAssets();
       } else {
@@ -1521,10 +1600,7 @@ struct Index {
   /** 同意隐私政策：落盘后继续启动流程。 */
   private agreePrivacy(): void {
     this.privacyPending = false;
-    preferences.getPreferences(getContext(this), PREF_STORE).then((pref: preferences.Preferences) => {
-      pref.putSync(PREF_PRIVACY_KEY, true);
-      pref.flush();
-    }).catch(() => {});
+    writePrivacyAgreed(getContext(this));
     this.initAssets();
   }
 
@@ -1557,7 +1633,7 @@ struct Index {
           .fontColor(Theme.text)
         Scroll() {
           Column({ space: 10 }) {
-            Text('DigitalFilm 是一款完全在本地运行的胶片模拟相机：不采集、不上传任何个人信息，也不申请任何系统权限。你选择的照片只在本机内存中参与渲染，成片由系统「保存到图库」确认框写入相册，无需授予存储权限。')
+            Text(PRIVACY_BODY_ZH)
               .fontSize(13)
               .lineHeight(21)
               .fontColor(Theme.secondary)
@@ -1652,6 +1728,7 @@ struct Index {
       this.filmIndex = def >= 0 ? def : 0;
       const dp: number = papers.findIndex((p: PaperAssets) => p.id === 'kodak_supra_endura');
       this.paperIndex = dp >= 0 ? dp : 0;
+      await this.applyIncoming();
     } catch (e) {
       const em: string = e instanceof Error ? (e.name + ': ' + e.message) : String(e);
       const st: string = (e instanceof Error && e.stack !== undefined) ? e.stack : '';
@@ -1912,76 +1989,23 @@ struct Index {
     const paper: PaperAssets = film.type === 'positive'
       ? (this.paperCache.get('scan_' + film.id) as PaperAssets)
       : this.papers[pair.paper];
-    const positive: boolean = film.type === 'positive';
-    const out: Uint8Array = new Uint8Array(w * h * 4);
-    // Each slice carries a private copy of the film and print tables, so
-    // 32 slices at 3000 px duplicated ~50 MB of payload. Twelve slices still
-    // saturate the worker threads without that memory spike.
-    const slices: number = Math.max(3, Math.min(12, Math.round(h / 160)));
-    const rowsPer: number = Math.ceil(h / slices);
-    const seed: number = pair.film * 97 + pair.paper * 31 + Math.round(ev * 10);
-    const tasks: Promise<Object>[] = [];
-    try {
-      for (let s = 0; s < slices; s++) {
-        const y0: number = s * rowsPer;
-        const y1: number = Math.min(h, y0 + rowsPer);
-        if (y0 >= y1) {
-          break;
-        }
-        const payload: SlicePayload = {
-          src: src.slice(y0 * w * 4, y1 * w * 4),
-          width: w, height: h, y0: y0, y1: y1,
-          tcLut: film.tcLut.slice(), tcB: film.tcB.slice(), curves: film.curves.slice(),
-          couplerCurves: film.coupler.slice(), plight: paper.lut.slice(),
-          paxes: paper.axes.slice(),
-          ev: ev, dirCouplers: true,
-          couplerAmount: this.couplers / 100.0,
-          eC: positive ? 0 : this.enlargerC / 100.0,
-          eM: positive ? 0 : this.enlargerM / 100.0,
-          eY: positive ? 0 : this.enlargerY / 100.0,
-          preflash: positive ? 0 : this.preflash / 100.0,
-          edr: positive ? 0 : this.edr / 100.0,
-          bwFilter: film.channelModel === 'bw' ? this.bwFilter : 0,
-          highlightBoost: positive ? 0 : this.highlightBoost,
-          highlightHeadroom: positive ? 0 : this.highlightHeadroom,
-          grain: this.grain / 100.0 * this.grainGain(film),
-          grainSeed: seed,
-          mono: film.channelModel === 'bw'
-        };
-        tasks.push(taskpool.execute(new taskpool.Task(renderSlice, payload)));
-      }
-      const total: number = tasks.length;
-      for (let s = 0; s < total; s++) {
-        const part: Uint8Array = (await tasks[s]) as Uint8Array;
-        out.set(part, s * rowsPer * w * 4);
-        this.progress = (s + 1) / total;
-      }
-      return out;
-    } catch (e) {
-      console.warn('taskpool render unavailable, using main thread');
-      const strip: number = 24;
-      for (let y = 0; y < h; y += strip) {
-        const rows: number = Math.min(strip, h - y);
-        const sub: Uint8Array = src.subarray(y * w * 4, (y + rows) * w * 4);
-        const part: Uint8Array = renderPixels(sub, w, rows, film, paper,
-          { ev: ev, dirCouplers: true,
-            couplerAmount: this.couplers / 100.0,
-            bwFilter: film.channelModel === 'bw' ? this.bwFilter : 0,
-            highlightBoost: positive ? 0 : this.highlightBoost,
-            highlightHeadroom: positive ? 0 : this.highlightHeadroom,
-            enlargerC: positive ? 0 : this.enlargerC / 100.0,
-            enlargerM: positive ? 0 : this.enlargerM / 100.0,
-            enlargerY: positive ? 0 : this.enlargerY / 100.0,
-            preflash: positive ? 0 : this.preflash / 100.0,
-            edr: positive ? 0 : this.edr / 100.0
-          });
-        out.set(part, y * w * 4);
-        this.progress = (y + rows) / h;
-        await sleep(8);
-      }
-      addGrain(out, w, h, this.grain / 100.0 * this.grainGain(film), seed);
-      return out;
-    }
+    const params: FilmRenderParams = {
+      ev: ev,
+      couplers: this.couplers / 100.0,
+      enlargerC: this.enlargerC / 100.0,
+      enlargerM: this.enlargerM / 100.0,
+      enlargerY: this.enlargerY / 100.0,
+      preflash: this.preflash / 100.0,
+      edr: this.edr / 100.0,
+      bwFilter: this.bwFilter,
+      highlightBoost: this.highlightBoost,
+      highlightHeadroom: this.highlightHeadroom,
+      grain: this.grain / 100.0 * grainGainFor(film),
+      seed: pair.film * 97 + pair.paper * 31 + Math.round(ev * 10)
+    };
+    return renderFilm(src, w, h, film, paper, params, (fraction: number) => {
+      this.progress = fraction;
+    });
   }
 
   private meterLabel(): string {
@@ -2008,19 +2032,6 @@ struct Index {
       return 'protect_shadows';
     }
     return 'balanced';
-  }
-
-  private grainGain(film: FilmAssets): number {
-    if (film.id === 'ilford_hp5_plus_400') {
-      return 1.49;
-    }
-    if (film.id === 'kodak_tmax_100') {
-      return 0.74;
-    }
-    if (film.id === 'fujifilm_neopan_acros_100_ii') {
-      return 0.64;
-    }
-    return 1.0;
   }
 
   /**
@@ -2123,6 +2134,10 @@ struct Index {
     addVignette(pixels, w, h, this.vignette / 100.0);
     adjustTone(pixels, w, h, this.toneContrast, this.toneSaturation, this.toneBrightness,
       this.toneHighlights, this.toneShadows);
+    if (this.hslBands.length >= 24) {
+      adjustHsl(pixels, w, h, this.hslBands);
+    }
+    addDispersion(pixels, w, h, this.dispersion / 100.0);
     convertP3ToSrgb(pixels, w, h);
     // 内置滤镜按保存顺序串联，面板里正在编辑的那一款排最后。
     const luts: LutLayer[] = this.allLuts();
@@ -2150,10 +2165,19 @@ struct Index {
     } else {
       edge = composeFilmEdge(pixels, w, h, tex.data, tex.w, tex.h, h > w);
     }
+    let ap: Uint8Array = edge.pixels;
+    let aw: number = edge.w;
+    let ah: number = edge.h;
     if (this.dateBack) {
-      addDateBack(edge.pixels, edge.w, edge.h, this.dateStamp(), edge.band);
+      addDateBack(ap, aw, ah, this.dateStamp(), edge.band);
     }
-    return { pixels: edge.pixels, w: edge.w, h: edge.h, stageMs: 'main' };
+    if (this.whiteEdge) {
+      const wm: EdgeResult = addWhiteMargin(ap, aw, ah, this.whiteScale);
+      ap = wm.pixels;
+      aw = wm.w;
+      ah = wm.h;
+    }
+    return { pixels: ap, w: aw, h: ah, stageMs: 'main' };
   }
 
   /**
@@ -2247,12 +2271,14 @@ struct Index {
       contrast: this.toneContrast, saturation: this.toneSaturation,
       brightness: this.toneBrightness, highlights: this.toneHighlights,
       shadows: this.toneShadows, edgeMode: this.edgeMode(),
+      hsl: this.hslBands.slice(), dispersion: this.dispersion / 100.0,
       edgeTex: tex !== null ? tex.data.slice() : undefined,
       edgeW: tex !== null ? tex.w : 0,
       edgeH: tex !== null ? tex.h : 0,
       edgePpm: tex !== null ? tex.ppm : 0,
       edgeRotate: h > w,
       dateBack: this.dateBack, dateText: this.dateStamp(),
+      whiteScale: this.whiteEdge && !this.filtersOff ? this.whiteScale : 0,
       luts: luts, lights: lights
     };
     return payload;
@@ -2301,6 +2327,12 @@ struct Index {
     addVignette(px, p.w, p.h, p.vignette);
     adjustTone(px, p.w, p.h, p.contrast, p.saturation, p.brightness,
       p.highlights, p.shadows);
+    if (p.hsl !== undefined) {
+      adjustHsl(px, p.w, p.h, p.hsl);
+    }
+    if (p.dispersion !== undefined) {
+      addDispersion(px, p.w, p.h, p.dispersion);
+    }
     convertP3ToSrgb(px, p.w, p.h);
     for (let i = 0; i < p.luts.length; i++) {
       const L: PostLut = p.luts[i];
@@ -2330,10 +2362,19 @@ struct Index {
     } else {
       edge = addFilmEdge(p.pixels, p.w, p.h, p.edgeMode);
     }
+    let fp: Uint8Array = edge.pixels;
+    let fw: number = edge.w;
+    let fh: number = edge.h;
     if (p.dateBack) {
-      addDateBack(edge.pixels, edge.w, edge.h, p.dateText, edge.band);
+      addDateBack(fp, fw, fh, p.dateText, edge.band);
     }
-    return { pixels: edge.pixels, w: edge.w, h: edge.h, stageMs: 'main' };
+    if (p.whiteScale !== undefined && p.whiteScale > 0.05 && p.whiteScale <= 1.0) {
+      const wm: EdgeResult = addWhiteMargin(fp, fw, fh, p.whiteScale);
+      fp = wm.pixels;
+      fw = wm.w;
+      fh = wm.h;
+    }
+    return { pixels: fp, w: fw, h: fh, stageMs: 'main' };
   }
 
   /** 内置滤镜栈签名：滤镜或强度任一变化都要重新调色。 */
@@ -2471,6 +2512,15 @@ struct Index {
       this.enlargerY + ',' + this.preflash + ',' + this.edr + ',' + this.bwFilter + ',' +
       this.highlightBoost + ',' + this.highlightHeadroom + ',' + this.grain;
     return sig;
+  }
+
+  /** 光学/调色滑块：拖动中跑低清实时预览，松手由调用方跑全分辨率。 */
+  private previewDuringDrag(mode: SliderChangeMode): void {
+    if (mode === SliderChangeMode.End) {
+      this.cancelQuickRender();
+      return;
+    }
+    this.requestQuickRender();
   }
 
   private lastQuickMs: number = 0;
@@ -2827,27 +2877,12 @@ struct Index {
   }
 
   async exportToLibrary(path: string, ext: string): Promise<boolean> {
-    try {
-      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
-      const helper: photoAccessHelper.PhotoAccessHelper = photoAccessHelper.getPhotoAccessHelper(ctx);
-      const cfg: photoAccessHelper.PhotoCreationConfig = {
-        title: 'DigitalFilm_' + Date.now(),
-        fileNameExtension: ext, 
-        photoType: photoAccessHelper.PhotoType.IMAGE
-      };
-      const tmpUri: string = fileUri.getUriFromPath(path);
-      const uris: string[] = await helper.showAssetsCreationDialog([tmpUri], [cfg]);
-      if (uris.length > 0) {
-        const dest = fs.openSync(uris[0], fs.OpenMode.READ_WRITE);
-        fs.copyFileSync(path, dest.fd);
-        fs.closeSync(dest);
-        return true;
-      }
-      return false;
-    } catch (e) {
+    const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+    const saved: boolean = await saveToAlbum(ctx, path, ext);
+    if (!saved) {
       promptAction.showToast({ message: this.t('已存到应用缓存: ', 'Saved to app cache: ') + path, duration: 3000 });
-      return false;
     }
+    return saved;
   }
 
   pairLabel(id: string): string {
@@ -2866,30 +2901,16 @@ struct Index {
 
   /** Short maker mark stamped on the drawn canister. */
   filmBrand(name: string): string {
-    if (name.indexOf('Fujifilm') === 0) { return 'FUJIFILM'; }
-    if (name.indexOf('Ilford') === 0) { return 'ILFORD'; }
-    if (name.indexOf('CineStill') === 0) { return 'CINESTILL'; }
-    return 'KODAK';
+    return catalogBrand(name);
   }
 
   /** First 2-4 digit group in the stock name is its ISO rating. */
   filmIso(f: FilmAssets): string {
-    let digits: string = '';
-    for (let i = 0; i < f.name.length; i++) {
-      const c: string = f.name.charAt(i);
-      if (c >= '0' && c <= '9') {
-        digits += c;
-      } else if (digits.length >= 2) {
-        break;
-      } else if (digits.length === 1) {
-        digits = '';
-      }
-    }
-    return digits.length > 0 ? digits : 'FILM';
+    return catalogIso(f);
   }
 
   isCineFilm(f: FilmAssets): boolean {
-    return f.id.indexOf('vision3') >= 0 || f.id.indexOf('verita') >= 0;
+    return catalogCine(f);
   }
 
   isCinePaper(p: PaperAssets): boolean {
@@ -3007,10 +3028,19 @@ struct Index {
   @Builder
   topBar() {
     Row() {
-      Text('DigitalFilm')
-        .fontSize(10)
-        .letterSpacing(1.6)
-        .fontColor(Theme.dim)
+      Text('‹')
+        .fontSize(16)
+        .fontColor(Theme.secondary)
+        .padding({ left: 0, right: 8, top: 0, bottom: 2 })
+        .onClick(() => {
+          router.back();
+        })
+      Text(this.t('打开', 'OPEN'))
+        .fontSize(9)
+        .letterSpacing(0.8)
+        .fontColor(Theme.accent)
+        .padding({ left: 0, right: 10, top: 5, bottom: 5 })
+        .onClick(() => this.pickPhoto())
       Blank()
       Text(this.busy ? this.t('处理中 ', 'PROCESSING ') + Math.round(this.progress * 100) + '%' :
         this.t('就绪', 'READY'))
@@ -3078,10 +3108,24 @@ struct Index {
         .visibility(this.isWide() ? Visibility.None : Visibility.Visible)
         .fontSize(11)
         .fontColor(Theme.secondary)
-        .padding({ left: 8, right: 4, top: 5, bottom: 5 })
+        .padding({ left: 8, right: 6, top: 5, bottom: 5 })
         .onClick(() => {
           this.drawerOpen = !this.drawerOpen;
         })
+      // 保存成片：与泼辣一致，收成右上角一个导出图标。
+      Image(this.hasPhoto && !this.busy
+        ? $r('app.media.ic_export_on') : $r('app.media.ic_export'))
+        .width(22)
+        .height(22)
+        .objectFit(ImageFit.Contain)
+        .opacity(this.hasPhoto && !this.busy ? 1.0 : 0.4)
+      .margin({ left: 2, right: 2 })
+      .opacity(this.hasPhoto && !this.busy ? 1.0 : 0.45)
+      .onClick(() => {
+        if (this.hasPhoto && !this.busy) {
+          this.savePhoto();
+        }
+      })
     }
     .width('100%')
     .height(38)
@@ -3566,23 +3610,42 @@ struct Index {
       })
   }
 
-  /** 抽屉顶部的场景分页，把控件按使用场景拆开。 */
+  /** 底部入口图标资源：滤镜 / 重构 / 调整 / 图层 / 输出（含选中态强调色）。 */
+  private tabIconRes(index: number, active: boolean): Resource {
+    if (index === 0) {
+      return active ? $r('app.media.ic_tab_filter_on') : $r('app.media.ic_tab_filter');
+    }
+    if (index === 1) {
+      return active ? $r('app.media.ic_tab_crop_on') : $r('app.media.ic_tab_crop');
+    }
+    if (index === 2) {
+      return active ? $r('app.media.ic_tab_adjust_on') : $r('app.media.ic_tab_adjust');
+    }
+    if (index === 3) {
+      return active ? $r('app.media.ic_tab_light_on') : $r('app.media.ic_tab_light');
+    }
+    if (index === 4) {
+      return active ? $r('app.media.ic_tab_layers_on') : $r('app.media.ic_tab_layers');
+    }
+    return active ? $r('app.media.ic_tab_output_on') : $r('app.media.ic_tab_output');
+  }
+
+  /** 底部常驻入口：图标 + 文字，顺序与正常修图流程一致。 */
   @Builder
-  sceneChip(zh: string, en: string, index: number) {
+  bottomTab(zh: string, en: string, index: number) {
     Column() {
+      Image(this.tabIconRes(index, this.drawerTab === index && (this.drawerOpen || this.isWide())))
+        .width(19)
+        .height(19)
+        .objectFit(ImageFit.Contain)
       Text(this.t(zh, en))
         .fontSize(10)
-        .letterSpacing(1.0)
-        .fontColor(this.drawerTab === index ? Theme.accent : Theme.dim)
-        .layoutWeight(1)
-        .textAlign(TextAlign.Center)
-      Row()
-        .width('100%')
-        .height(2)
-        .backgroundColor(this.drawerTab === index ? Theme.accent : Color.Transparent)
+        .letterSpacing(0.6)
+        .margin({ top: 5 })
+        .fontColor(this.drawerTab === index && (this.drawerOpen || this.isWide()) ? Theme.accent : Theme.secondary)
     }
     .justifyContent(FlexAlign.Center)
-    .height(30)
+    .height(52)
     .layoutWeight(1)
     .onClick(() => {
       this.setDrawerTab(index);
@@ -3590,17 +3653,209 @@ struct Index {
   }
 
   @Builder
+  adjustChip(zh: string, en: string, index: number) {
+    Column() {
+      Text(this.t(zh, en))
+        .fontSize(9.5)
+        .fontColor(this.adjustTab === index ? Theme.text : Theme.dim)
+        .fontWeight(this.adjustTab === index ? FontWeight.Medium : FontWeight.Normal)
+      Row()
+        .width('100%')
+        .height(1.5)
+        .margin({ top: 5 })
+        .backgroundColor(this.adjustTab === index ? Theme.accent : Color.Transparent)
+    }
+    .layoutWeight(1)
+    .alignItems(HorizontalAlign.Center)
+    .onClick(() => {
+      this.adjustTab = index;
+    })
+  }
+
+  /** 调整 > HSL：八色相带 + 当前色相带的三个滑块。 */
+  @Builder
+  hslSection() {
+    Row() {
+      this.headerLabel('HSL', 'HSL')
+      Blank()
+      Text(this.t('八色相带', '8 BANDS'))
+        .fontSize(7.5)
+        .letterSpacing(0.6)
+        .fontColor(Theme.dim)
+    }
+    .width('100%')
+    .margin({ top: 6 })
+
+    Flex({ wrap: FlexWrap.Wrap }) {
+      ForEach(HSL_BAND_NAMES, (name: string, i: number) => {
+        Row() {
+          Row()
+            .width(7)
+            .height(7)
+            .borderRadius(4)
+            .backgroundColor(HSL_BAND_COLORS[i])
+            .margin({ right: 4 })
+          Text(this.t(name, HSL_BAND_NAMES_EN[i]))
+            .fontSize(9.5)
+            .fontWeight(this.hslBand === i ? FontWeight.Medium : FontWeight.Normal)
+            .fontColor(this.hslBand === i ? Theme.accent : Theme.secondary)
+        }
+        .alignItems(VerticalAlign.Center)
+        .padding({ top: 4, bottom: 4 })
+        .margin({ right: 14, bottom: 4 })
+        .onClick(() => {
+          this.hslBand = i;
+        })
+      }, (name: string, i: number) => 'hslb' + i)
+    }
+    .width('100%')
+    .margin({ top: 2 })
+
+    Row() {
+      this.hintLabel('色相', 'HUE',
+        '色相：只旋转所选色相带的颜色，±100 对应 ±45°',
+        'Hue: rotate the selected band only, ±100 equals ±45°')
+      Slider({ value: this.hslVal(this.hslBand, 0), min: -100, max: 100, step: 1,
+        style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+        .selectedColor(Theme.accent)
+        .trackColor(Theme.track)
+        .trackThickness(4)
+        .layoutWeight(1)
+        .onChange((value: number, mode: SliderChangeMode) => {
+          this.leaveOriginal();
+          this.setHsl(this.hslBand, 0, value);
+          this.previewDuringDrag(mode);
+          if (mode === SliderChangeMode.End) {
+            this.renderPreview();
+          }
+        })
+      Text(Math.round(this.hslVal(this.hslBand, 0)).toString())
+        .fontSize(10)
+        .fontColor(Theme.secondary)
+        .width(30)
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+    .margin({ top: 2 })
+    .alignItems(VerticalAlign.Center)
+
+    Row() {
+      this.hintLabel('饱和', 'SATUR',
+        '饱和：只增减所选色相带的色彩浓度',
+        'Saturation: adjust the selected band only')
+      Slider({ value: this.hslVal(this.hslBand, 1), min: -100, max: 100, step: 1,
+        style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+        .selectedColor(Theme.accent)
+        .trackColor(Theme.track)
+        .trackThickness(4)
+        .layoutWeight(1)
+        .onChange((value: number, mode: SliderChangeMode) => {
+          this.leaveOriginal();
+          this.setHsl(this.hslBand, 1, value);
+          this.previewDuringDrag(mode);
+          if (mode === SliderChangeMode.End) {
+            this.renderPreview();
+          }
+        })
+      Text(Math.round(this.hslVal(this.hslBand, 1)).toString())
+        .fontSize(10)
+        .fontColor(Theme.secondary)
+        .width(30)
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+    .margin({ top: 2 })
+    .alignItems(VerticalAlign.Center)
+
+    Row() {
+      this.hintLabel('明度', 'LUMA',
+        '明度：只提亮或压暗所选色相带',
+        'Luminance: lift or drop the selected band only')
+      Slider({ value: this.hslVal(this.hslBand, 2), min: -100, max: 100, step: 1,
+        style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+        .selectedColor(Theme.accent)
+        .trackColor(Theme.track)
+        .trackThickness(4)
+        .layoutWeight(1)
+        .onChange((value: number, mode: SliderChangeMode) => {
+          this.leaveOriginal();
+          this.setHsl(this.hslBand, 2, value);
+          this.previewDuringDrag(mode);
+          if (mode === SliderChangeMode.End) {
+            this.renderPreview();
+          }
+        })
+      Text(Math.round(this.hslVal(this.hslBand, 2)).toString())
+        .fontSize(10)
+        .fontColor(Theme.secondary)
+        .width(30)
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+    .margin({ top: 2 })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  /** 调整 > 色散：红/蓝通道沿中心径向分离。 */
+  @Builder
+  dispersionSection() {
+    Row() {
+      this.headerLabel('色散', 'DISPERSION')
+      Blank()
+      Text(this.t('RGB 通道偏移', 'RGB SPLIT'))
+        .fontSize(7.5)
+        .letterSpacing(0.6)
+        .fontColor(Theme.dim)
+    }
+    .width('100%')
+    .margin({ top: 6 })
+
+    Text(this.t('色散：红/蓝通道沿画面中心向外或向内分离，模拟镜头色差。',
+      'Dispersion: red and blue split radially to mimic lens chromatic aberration.'))
+      .fontSize(8)
+      .fontColor(Theme.dim)
+      .width('100%')
+      .margin({ top: 4, bottom: 2 })
+
+    Row() {
+      this.hintLabel('数量', 'AMOUNT',
+        '色散数量：正值向外扩散，负值向内收拢',
+        'Dispersion: positive spreads outward, negative pulls inward')
+      Slider({ value: this.dispersion, min: -100, max: 100, step: 1,
+        style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+        .selectedColor(Theme.accent)
+        .trackColor(Theme.track)
+        .trackThickness(4)
+        .layoutWeight(1)
+        .onChange((value: number, mode: SliderChangeMode) => {
+          this.leaveOriginal();
+          this.dispersion = value;
+          this.previewDuringDrag(mode);
+          if (mode === SliderChangeMode.End) {
+            this.renderPreview();
+          }
+        })
+      Text(Math.round(this.dispersion).toString())
+        .fontSize(10)
+        .fontColor(Theme.secondary)
+        .width(30)
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+    .margin({ top: 2 })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
   lightFlipChip(zh: string, en: string, horizontal: boolean) {
     Text(this.t(zh, en))
       .fontSize(9)
       .fontColor((horizontal ? this.lightFlipH : this.lightFlipV) ? Theme.accent : Theme.secondary)
-      .backgroundColor((horizontal ? this.lightFlipH : this.lightFlipV) ? Theme.cardRaised : Theme.card)
-      .border({
-        width: 1,
-        color: (horizontal ? this.lightFlipH : this.lightFlipV) ? Theme.accent : Theme.rule
-      })
-      .borderRadius(2)
-      .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+      .padding({ left: 8, right: 0, top: 4, bottom: 4 })
       .margin({ left: 6 })
       .onClick(() => {
         this.lightDraft = true;
@@ -3616,13 +3871,11 @@ struct Index {
   @Builder
   lightChip(index: number, zh: string, en: string) {
     Text(this.t(zh, en))
-      .fontSize(9)
+      .fontSize(9.5)
+      .fontWeight(this.lightIndex === index ? FontWeight.Medium : FontWeight.Normal)
       .fontColor(this.lightIndex === index ? Theme.accent : Theme.secondary)
-      .backgroundColor(this.lightIndex === index ? Theme.cardRaised : Theme.card)
-      .border({ width: 1, color: this.lightIndex === index ? Theme.accent : Theme.rule })
-      .borderRadius(2)
-      .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-      .margin({ right: 6, bottom: 4 })
+      .padding({ top: 4, bottom: 4 })
+      .margin({ right: 14, bottom: 4 })
       .onClick(() => this.selectLight(index))
   }
 
@@ -3760,19 +4013,24 @@ struct Index {
   @Builder
   drawer() {
     Column() {
+      if (this.drawerOpen || this.isWide()) {
       Divider()
         .strokeWidth(1)
         .color(Theme.rule)
-      Row() {
-        this.sceneChip('滤镜', 'FILTER', 0)
-        this.sceneChip('光学', 'OPTICS', 1)
-        this.sceneChip('灯光', 'LIGHT', 5)
-        this.sceneChip('构图', 'FRAME', 2)
-        this.sceneChip('调色', 'COLOR', 3)
-        this.sceneChip('输出', 'OUTPUT', 4)
+      if (this.drawerTab === 2) {
+        Row() {
+          this.adjustChip('光效', 'LIGHT', 0)
+          this.adjustChip('色彩', 'COLOR', 1)
+          this.adjustChip('HSL', 'HSL', 2)
+          this.adjustChip('色调', 'TONE', 3)
+          this.adjustChip('特效', 'FX', 4)
+          this.adjustChip('色散', 'SPLIT', 5)
+          this.adjustChip('质感', 'TEXTURE', 6)
+          this.adjustChip('暗角', 'VIGNETTE', 7)
+        }
+        .width('100%')
+        .margin({ bottom: 6 })
       }
-      .width('100%')
-      .margin({ top: 8, bottom: 8 })
 
       if (this.drawerTab === 0) {
       Scroll() {
@@ -3813,7 +4071,7 @@ struct Index {
       .height(this.panelScrollH())
       }
 
-      if (this.drawerTab === 3) {
+      if (this.drawerTab === 2 && this.adjustTab === 0) {
       Row() {
         Text('EV')
           .fontSize(9)
@@ -3838,6 +4096,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.ev = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End && !this.autoExposure) {
               this.renderPreview();
             }
@@ -3868,7 +4127,7 @@ struct Index {
       if (this.drawerTab !== 0) {
       Scroll() {
         Column() {
-      if (this.drawerTab === 3 && this.autoExposure) {
+      if (this.drawerTab === 2 && this.adjustTab === 0 && this.autoExposure) {
         Row() {
           Text(this.t('测光模式', 'METERING'))
             .fontSize(9)
@@ -3892,7 +4151,7 @@ struct Index {
         .alignItems(VerticalAlign.Center)
       }
 
-      if (this.drawerTab === 3) {
+      if (this.drawerTab === 2 && this.adjustTab === 0) {
       Row() {
         this.hintLabel('预闪', 'PRE-FLASH',
           '预闪：均匀预曝光，提亮暗部并降低对比',
@@ -3922,7 +4181,11 @@ struct Index {
 
       }
 
-      if (this.drawerTab === 2) {
+      if (this.drawerTab === 2 && this.adjustTab === 2) {
+        this.hslSection()
+      }
+
+      if (this.drawerTab === 1) {
       Flex({ wrap: FlexWrap.Wrap }) {
         this.hintLabel('画面', 'FRAME',
           '裁剪比例；胶卷画幅：半幅 3:4、135 3:2、6×6 1:1、6×7 5:4、6×9 3:2',
@@ -4060,7 +4323,7 @@ struct Index {
 
       }
 
-      if (this.drawerTab === 3) {
+      if (this.drawerTab === 2 && this.adjustTab === 0) {
       Row() {
         this.hintLabel('EDR', 'EDR',
           '扩展动态范围：压缩打印高光肩部，保留高光层次',
@@ -4101,6 +4364,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.toneHighlights = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4128,6 +4392,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.toneShadows = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4144,11 +4409,12 @@ struct Index {
 
       }
 
-      if (this.drawerTab === 1) {
+      if (this.drawerTab === 2 && (this.adjustTab === 4 || this.adjustTab === 7)) {
+      if (this.adjustTab === 4) {
       Row() {
         this.headerLabel('画质', 'LOOK')
         Blank()
-        Text(this.t('眩光 / 散射 / 暗角', 'GLARE / SCATTER / VIGNETTE'))
+        Text(this.t('眩光 / 散射', 'GLARE / SCATTER'))
           .fontSize(7.5)
           .letterSpacing(0.6)
           .fontColor(Theme.dim)
@@ -4169,6 +4435,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.glare = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4196,6 +4463,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.scatter = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4209,6 +4477,19 @@ struct Index {
       .width('100%')
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
+      }
+
+      if (this.adjustTab === 7) {
+      Row() {
+        this.headerLabel('暗角', 'VIGNETTE')
+        Blank()
+        Text(this.t('数量 / 中点 / 羽化', 'AMOUNT / MID / FEATHER'))
+          .fontSize(7.5)
+          .letterSpacing(0.6)
+          .fontColor(Theme.dim)
+      }
+      .width('100%')
+      .margin({ top: 6 })
 
       Row() {
         this.hintLabel('暗角', 'VIGNETTE',
@@ -4223,6 +4504,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.vignette = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4236,10 +4518,11 @@ struct Index {
       .width('100%')
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
+      }
 
       }
 
-      if (this.drawerTab === 5) {
+      if (this.drawerTab === 3) {
       Row() {
         this.headerLabel('灯光', 'LIGHT')
         Blank()
@@ -4453,7 +4736,11 @@ struct Index {
 
       }
 
-      if (this.drawerTab === 1) {
+      if (this.drawerTab === 4) {
+        this.appliedSummary()
+      }
+
+      if (this.drawerTab === 2 && this.adjustTab === 6) {
       Row() {
         this.headerLabel('质感', 'TEXTURE')
         Blank()
@@ -4505,6 +4792,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.halation = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4521,49 +4809,21 @@ struct Index {
 
       }
 
-      if (this.drawerTab === 2) {
-      Row() {
-        this.hintLabel('胶片框', 'FRAME MARKS',
-          '片边：加上齿孔边框；日期背印：加橙色日期戳',
-          'Film edge adds sprocket borders; date back stamps an orange date')
-        Blank()
-        Text(this.t('片边', 'EDGE'))
-          .fontSize(10)
-          .fontColor(this.filmEdge ? Theme.accent : Theme.secondary)
-          .backgroundColor(this.filmEdge ? Theme.cardRaised : Theme.card)
-          .border({ width: 1, color: this.filmEdge ? Theme.accent : Theme.rule })
-          .borderRadius(2)
-          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-          .onClick(() => {
-            this.leaveOriginal();
-            this.filmEdge = !this.filmEdge;
-            this.renderPreview();
-          })
-        Text(this.t('日期', 'DATE'))
-          .fontSize(10)
-          .fontColor(this.dateBack ? Theme.accent : Theme.secondary)
-          .backgroundColor(this.dateBack ? Theme.cardRaised : Theme.card)
-          .border({ width: 1, color: this.dateBack ? Theme.accent : Theme.rule })
-          .borderRadius(2)
-          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-          .margin({ left: 6 })
-          .onClick(() => {
-            this.leaveOriginal();
-            this.dateBack = !this.dateBack;
-            this.renderPreview();
-          })
-      }
-      .width('100%')
-      .margin({ top: 2 })
-      .alignItems(VerticalAlign.Center)
 
+      if (this.drawerTab === 2 && this.adjustTab === 5) {
+        this.dispersionSection()
       }
 
-      if (this.drawerTab === 3) {
+      if (this.drawerTab === 2 &&
+        (this.adjustTab === 0 || this.adjustTab === 1 || this.adjustTab === 3)) {
       Row() {
         this.headerLabel('后期', 'POST-DEV')
         Blank()
-        Text(this.t('对比 / 饱和 / 亮度', 'CONTRAST / SATUR / BRIGHT'))
+        Text(this.t(
+          this.adjustTab === 3 ? '高光扩展 / 宽容度' :
+            (this.adjustTab === 1 ? '饱和 / 放大机 / 成色剂' : '对比 / 亮度'),
+          this.adjustTab === 3 ? 'HILIGHT / HEADROOM' :
+            (this.adjustTab === 1 ? 'SATUR / ENLARGER / COUPLER' : 'CONTRAST / BRIGHT')))
           .fontSize(7.5)
           .letterSpacing(0.6)
           .fontColor(Theme.dim)
@@ -4571,6 +4831,7 @@ struct Index {
       .width('100%')
       .margin({ top: 6 })
 
+      if (this.adjustTab === 0) {
       Row() {
         this.hintLabel('对比', 'CONTRAST',
           '对比：后期反差，正加负减',
@@ -4584,6 +4845,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.toneContrast = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4598,6 +4860,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.adjustTab === 1) {
       Row() {
         this.hintLabel('饱和', 'SATUR',
           '饱和：色彩浓度，-100 为黑白',
@@ -4611,6 +4876,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.toneSaturation = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4625,6 +4891,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.adjustTab === 0) {
       Row() {
         this.hintLabel('亮度', 'BRIGHT',
           '亮度：整体明暗微调',
@@ -4638,6 +4907,7 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.toneBrightness = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
               this.renderPreview();
             }
@@ -4652,6 +4922,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.adjustTab === 3) {
       Row() {
         this.hintLabel('高光扩展', 'HILIGHT',
           '高光扩展：进一步压缩打印高光肩部，找回高光层次',
@@ -4708,6 +4981,9 @@ struct Index {
       .margin({ top: 2 })
       .alignItems(VerticalAlign.Center)
 
+      }
+
+      if (this.adjustTab === 1) {
       Row() {
         this.hintLabel('放大机', 'ENLARGER',
           '放大机：模拟二向色滤镜，黄偏暖、品红偏品、青偏冷',
@@ -4860,9 +5136,11 @@ struct Index {
 
       }
 
-      if (this.drawerTab === 4) {
+      }
+
+      if (this.drawerTab === 5) {
       Row() {
-        this.headerLabel('导出', 'EXPORT')
+        this.headerLabel('图片 · 导出', 'IMAGE · EXPORT')
       }
       .width('100%')
       .margin({ top: 8, bottom: 6 })
@@ -4878,7 +5156,86 @@ struct Index {
       .width('100%')
       .margin({ top: 2 })
 
-      this.appliedSummary()
+      Row() {
+        this.hintLabel('白边', 'WHITE BORDER',
+          '纯白画布：照片按比例居中，双指捏合可以缩放照片',
+          'White canvas: the photo sits centred; pinch to resize it')
+        Blank()
+        Text(this.t('白边', 'WHITE'))
+          .fontSize(10)
+          .fontWeight(this.whiteEdge ? FontWeight.Medium : FontWeight.Normal)
+          .fontColor(this.whiteEdge ? Theme.accent : Theme.secondary)
+          .padding({ left: 6, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.leaveOriginal();
+            this.whiteEdge = !this.whiteEdge;
+            this.renderPreview();
+          })
+      }
+      .width('100%')
+      .margin({ top: 6 })
+      .alignItems(VerticalAlign.Center)
+
+      if (this.whiteEdge) {
+        Row() {
+          Text(this.t('照片', 'PHOTO'))
+            .fontSize(10)
+            .fontColor(Theme.dim)
+            .width(62)
+          Slider({ value: this.whiteScale * 100, min: 40, max: 100, step: 1 })
+            .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .selectedColor(Theme.accent)
+            .trackColor(Theme.track)
+            .trackThickness(4)
+            .layoutWeight(1)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.leaveOriginal();
+              this.whiteScale = value / 100.0;
+              this.previewDuringDrag(mode);
+              if (mode === SliderChangeMode.End) {
+                this.renderPreview();
+              }
+            })
+          Text(Math.round(this.whiteScale * 100) + '%')
+            .fontSize(10)
+            .fontColor(Theme.secondary)
+            .width(32)
+            .textAlign(TextAlign.End)
+        }
+        .width('100%')
+        .margin({ top: 0 })
+        .alignItems(VerticalAlign.Center)
+      }
+
+      Row() {
+        this.hintLabel('胶片框', 'FRAME MARKS',
+          '片边：加上齿孔边框；日期背印：加橙色日期戳',
+          'Film edge adds sprocket borders; date back stamps an orange date')
+        Blank()
+        Text(this.t('片边', 'EDGE'))
+          .fontSize(10)
+          .fontWeight(this.filmEdge ? FontWeight.Medium : FontWeight.Normal)
+          .fontColor(this.filmEdge ? Theme.accent : Theme.secondary)
+          .padding({ left: 6, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.leaveOriginal();
+            this.filmEdge = !this.filmEdge;
+            this.renderPreview();
+          })
+        Text(this.t('日期', 'DATE'))
+          .fontSize(10)
+          .fontWeight(this.dateBack ? FontWeight.Medium : FontWeight.Normal)
+          .fontColor(this.dateBack ? Theme.accent : Theme.secondary)
+          .padding({ left: 12, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.leaveOriginal();
+            this.dateBack = !this.dateBack;
+            this.renderPreview();
+          })
+      }
+      .width('100%')
+      .margin({ top: 4 })
+      .alignItems(VerticalAlign.Center)
       }
 
         }
@@ -4902,33 +5259,23 @@ struct Index {
           .margin({ top: 4 })
       }
 
+      }
+
+      Divider()
+        .strokeWidth(1)
+        .color(Theme.rule)
       Row() {
-        Button(this.t('选择照片', 'SELECT PHOTO'))
-          .type(ButtonType.Normal)
-          .borderRadius(4)
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(12)
-          .fontColor(Theme.text)
-          .backgroundColor(Theme.card)
-          .onClick(() => this.pickPhoto())
-        Button(this.busy ? this.t('处理中…', 'BUSY…') : this.t('保存成片', 'SAVE PRINT'))
-          .type(ButtonType.Normal)
-          .borderRadius(4)
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(12)
-          .margin({ left: 8 })
-          .backgroundColor(this.hasPhoto && !this.busy ? Theme.accent : Theme.card)
-          .fontColor(this.hasPhoto && !this.busy ? Theme.onSelection : Theme.dim)
-          .enabled(this.hasPhoto && !this.busy)
-          .onClick(() => this.savePhoto())
+        this.bottomTab('滤镜', 'FILTER', 0)
+        this.bottomTab('重构', 'REFRAME', 1)
+        this.bottomTab('调整', 'ADJUST', 2)
+        this.bottomTab('灯光', 'LIGHT', 3)
+        this.bottomTab('图层', 'LAYERS', 4)
+        this.bottomTab('输出', 'EXPORT', 5)
       }
       .width('100%')
-      .margin({ top: 8 })
     }
     .width('100%')
-    .padding({ left: 10, right: 10, bottom: 12 })
+    .padding({ left: 10, right: 10, bottom: 4 })
     .backgroundColor(Theme.ground)
   }
 
@@ -5185,6 +5532,8 @@ struct Index {
                     this.pinchLightType = 0;
                     this.pinchLayerId = -1;
                     this.pinchBaseScale = this.lightScale;
+                    // 白边模式下不再缩放灯光，双指直接调照片在白底上的大小。
+                    this.pinchWhiteOn = false;
                     if (this.pinchLightOn) {
                       const s0: number = this.previewScale();
                       const iw: number = (this.innerW > 0 ? this.innerW : this.previewW) * s0;
@@ -5226,6 +5575,9 @@ struct Index {
                         }
                       }
                       this.pinchLightOn = found;
+                      this.pinchWhiteOn = !found && this.whiteEdge && !this.filtersOff &&
+                        this.zoomK <= 1.0;
+                      this.pinchBaseWhite = this.whiteScale;
                       // 单指 Pan 可能比第二根手指先起手，这里把拖灯状态收掉：
                       // 否则捏合期间外框会被隐藏、还会多画一个拖拽光斑。
                       if (this.pinchLightOn) {
@@ -5243,6 +5595,10 @@ struct Index {
                         this.lightDraft = true;
                         this.lightScale = sc;
                       }
+                    } else if (this.pinchWhiteOn) {
+                      const ns: number = this.pinchBaseWhite * e.scale;
+                      this.whiteScale = Math.max(0.4, Math.min(1.0, ns));
+                      this.requestQuickRender();
                     } else {
                       this.zoomK = Math.max(1.0, Math.min(8.0, this.baseZoom * e.scale));
                       if (this.zoomK <= 1.0) {
@@ -5257,12 +5613,17 @@ struct Index {
                       this.pinchLightOn = false;
                       this.afterLightEdit();
                     }
+                    if (this.pinchWhiteOn) {
+                      this.pinchWhiteOn = false;
+                      this.renderPreview();
+                    }
                   })
                   .onActionCancel(() => {
                     if (this.pinchLightOn) {
                       this.pinchLightOn = false;
                       this.afterLightEdit();
                     }
+                    this.pinchWhiteOn = false;
                   }),
                 PanGesture({ fingers: 1 })
                   .onActionStart((e: GestureEvent) => {
@@ -5421,11 +5782,6 @@ struct Index {
                   }),
                 TapGesture({ count: 1 })
                   .onAction(() => {
-                    // 底部面板收起（全屏看图）时，单击图片恢复编辑面板。
-                    if (!this.isWide() && !this.drawerOpen) {
-                      this.drawerOpen = true;
-                      return;
-                    }
                     // 面板展开时单击画布复位缩放：放大或平移后点一下图片回到 100% 居中。
                     if (this.zoomK > 1.0 || this.panX !== 0 || this.panY !== 0 ||
                       this.cropDx !== 0 || this.cropDy !== 0) {
@@ -5476,7 +5832,7 @@ struct Index {
         this.viewH = Number(area.height);
       })
 
-        if (!this.isWide() && this.drawerOpen) {
+        if (!this.isWide()) {
           this.drawer()
         }
       }
