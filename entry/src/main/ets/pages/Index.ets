@@ -19,12 +19,12 @@ import { addHalationGlare, addScatter, addVignette, adjustTone, adjustHsl,
   addDispersion, addFilmEdge, composeFilmEdge, composeMediumEdge, EdgeResult,
   addDateBack, convertP3ToSrgb, applyColorLut, applyLightLayer,
   addWhiteMargin } from '../engine/PostProcess';
-import { postTask, gradeTask, finishTask, GradeResult, PostPayload, PostResult, PostLight,
-  PostLut } from '../engine/PostTask';
+import { postTask, gradeTask, finishTask, lightTask, GradeResult, PostPayload, PostResult,
+  PostLight, PostLut } from '../engine/PostTask';
 import { taskpool } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { renderFilm, grainGainFor, FilmRenderParams } from '../engine/FilmRender';
-import { rotate90, straighten, flip, correctLens, resizeBox, GeoResult } from '../engine/Geometry';
+import { rotate90, straighten, flip, correctLens, perspective, resizeBox, GeoResult } from '../engine/Geometry';
 import { geometryTask, GeometryPayload } from '../engine/GeoTask';
 import { buildExifApp1, insertExif, exifTimestamp } from '../engine/Exif';
 import { IMAGE_SUFFIX_FILTER, OpenedImage, openImageSource } from '../engine/ImageImport';
@@ -142,6 +142,8 @@ interface LightLayer {
   rot: number;
   flipH: boolean;
   flipV: boolean;
+  /** 外框宽高比（宽/高）；0 或未设置 = 跟贴图原始比例（自由修改模式由 8 个控制点写出）。 */
+  aspect?: number;
 }
 
 /** One saved built-in filter layer; layers are graded in list order. */
@@ -223,10 +225,13 @@ interface FilterSnap {
   flipV: boolean;
   lensCorrection: number;
   straighten: number;
+  perspH: number;
+  perspV: number;
   aspect: number;
   aspectId: string;
   cropX: number;
   cropY: number;
+  cropZoom: number;
   ev: number;
   hslBands: number[];
   dispersion: number;
@@ -238,6 +243,8 @@ interface FilterSnap {
   lightRot: number;
   lightFlipH: boolean;
   lightFlipV: boolean;
+  /** 面板这盏灯的自由外框比例；0 = 跟贴图比例。 */
+  lightAspectFree: number;
   lightLayers: LightLayer[];
   filmLayers: FilmLayer[];
   lutLayers: LutLayer[];
@@ -350,6 +357,8 @@ struct Index {
   @State lightIndex: number = 0;
   @State lightStrength: number = 30;
   @State lightScale: number = 45;
+  /** 面板这盏灯的灯框宽高比；0 = 跟贴图比例，拖动控制点后写自由比例。 */
+  @State lightAspectFree: number = 0;
   @State lightX: number = 0;
   @State lightY: number = 0;
   /** 已保存的灯光图层；面板当前编辑的那盏光仍由上面的 lightIndex 等状态表示。 */
@@ -379,6 +388,9 @@ struct Index {
   @State preflash: number = 0;
   @State edr: number = 0;
   @State straighten: number = 0;
+  /** 水平/垂直透视校正，-100..100。 */
+  @State perspH: number = 0;
+  @State perspV: number = 0;
   @State rotation: number = 0;
   @State flipH: boolean = false;
   @State flipV: boolean = false;
@@ -402,6 +414,19 @@ struct Index {
   /** Live drag offset (display px) while the crop window is being moved. */
   @State cropDx: number = 0;
   @State cropDy: number = 0;
+  /** 裁切编辑态：预览显示完整画面，叠加可拖动的裁切框；拖动不触发像素渲染。 */
+  @State cropEditing: boolean = false;
+  @State cropFrameDx: number = 0;
+  @State cropFrameDy: number = 0;
+  /** 裁切框尺寸（vp）：8 个控制点直接改写，确认时再换算成 cropZoom。 */
+  @State cropFrameW: number = 0;
+  @State cropFrameH: number = 0;
+  /** 自由比例：>0 时裁切框可任意宽高比，0 = 跟随当前画幅。 */
+  @State cropRatio: number = 0;
+  /** 当前抓住的控制点：0..7 缩放手柄，8 = 框内平移，-1 = 空。 */
+  private cropHandle: number = -1;
+  /** 裁切框大小：1 = 该画幅可用的最大框，越小框越紧。 */
+  @State cropZoom: number = 1.0;
   @State lang: string = 'zh';
   /** 0 = the film pipeline (膠卷), 1 = the built-in colour filters. */
   @State filterTab: number = 0;
@@ -442,7 +467,7 @@ struct Index {
       const l: LightLayer = src[i];
       out.push({ id: l.id, preset: l.preset, strength: l.strength,
         scale: l.scale, x: l.x, y: l.y,
-        rot: l.rot, flipH: l.flipH, flipV: l.flipV });
+        rot: l.rot, flipH: l.flipH, flipV: l.flipV, aspect: l.aspect });
     }
     return out;
   }
@@ -551,11 +576,12 @@ struct Index {
   /** 已保存的灯光图层 + 面板当前这盏光，按叠加顺序展开。 */
   private allLights(): LightLayer[] {
     const out: LightLayer[] = this.cloneLights(this.lightLayers);
-    if (this.lightDraft && !this.filtersOff && this.lightIndex > 0 &&
+    if (this.lightDraft && this.lightIndex > 0 &&
       this.lightStrength > 0) {
       out.push({ id: -1, preset: this.lightIndex, strength: this.lightStrength,
         scale: this.lightScale, x: this.lightX, y: this.lightY,
-        rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV });
+        rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV,
+        aspect: this.lightAspectFree });
     }
     return out;
   }
@@ -655,14 +681,16 @@ struct Index {
       lightIndex: this.lightIndex, lightStrength: this.lightStrength,
       lightScale: this.lightScale, lightX: this.lightX, lightY: this.lightY,
       lightRot: this.lightRot, lightFlipH: this.lightFlipH, lightFlipV: this.lightFlipV,
+      lightAspectFree: this.lightAspectFree,
       lightLayers: this.cloneLights(this.lightLayers),
       filmLayers: this.cloneFilms(this.filmLayers),
       lutLayers: this.cloneLuts(this.lutLayers),
       lightDraft: this.lightDraft, filmDraft: this.filmDraft, lutDraft: this.lutDraft,
       rotation: this.rotation, flipH: this.flipH, flipV: this.flipV,
       lensCorrection: this.lensCorrection, straighten: this.straighten,
+      perspH: this.perspH, perspV: this.perspV,
       aspect: this.aspect, aspectId: this.aspectId,
-      cropX: this.cropX, cropY: this.cropY, ev: this.ev,
+      cropX: this.cropX, cropY: this.cropY, cropZoom: this.cropZoom, ev: this.ev,
       hslBands: this.hslBands.slice(), dispersion: this.dispersion
     };
   }
@@ -699,6 +727,7 @@ struct Index {
     this.lightRot = s.lightRot;
     this.lightFlipH = s.lightFlipH;
     this.lightFlipV = s.lightFlipV;
+    this.lightAspectFree = s.lightAspectFree;
     this.lightLayers = this.cloneLights(s.lightLayers);
     this.filmLayers = this.cloneFilms(s.filmLayers);
     this.lutLayers = this.cloneLuts(s.lutLayers);
@@ -719,15 +748,21 @@ struct Index {
     this.flipV = s.flipV;
     this.lensCorrection = s.lensCorrection;
     this.straighten = s.straighten;
+    this.perspH = s.perspH;
+    this.perspV = s.perspV;
     this.aspect = s.aspect;
     this.aspectId = s.aspectId;
     this.cropX = s.cropX;
     this.cropY = s.cropY;
+    this.cropZoom = s.cropZoom;
     this.ev = s.ev;
     this.hslBands = s.hslBands.slice();
     this.dispersion = s.dispersion;
     this.cropDx = 0;
     this.cropDy = 0;
+    this.cropEditing = false;
+    this.cropFrameDx = 0;
+    this.cropFrameDy = 0;
     this.undoCount = this.undoStack.length;
     this.renderPreview();
   }
@@ -747,6 +782,7 @@ struct Index {
     this.lightRot = 0;
     this.lightFlipH = false;
     this.lightFlipV = false;
+    this.lightAspectFree = 0;
     this.lightLayers = [];
     this.lutLayers = [];
     this.filmLayers = [];
@@ -770,12 +806,21 @@ struct Index {
     this.flipV = false;
     this.lensCorrection = 0;
     this.straighten = 0;
+    this.perspH = 0;
+    this.perspV = 0;
     this.aspect = 0;
     this.aspectId = 'full';
     this.cropX = 0.5;
     this.cropY = 0.5;
     this.cropDx = 0;
     this.cropDy = 0;
+    this.cropEditing = false;
+    this.cropFrameDx = 0;
+    this.cropFrameDy = 0;
+    this.cropZoom = 1.0;
+    this.cropRatio = 0;
+    this.cropFrameW = 0;
+    this.cropFrameH = 0;
     this.ev = 0;
     this.renderPreview();
   }
@@ -833,12 +878,12 @@ struct Index {
    * 拖动、增删、调强度都只是 GPU 合成，永远不用等 1~2 秒的像素链。
    */
   private lightLive(): boolean {
-    return !this.filtersOff && this.hasPhoto && !this.showOriginal && this.allLights().length > 0;
+    return this.hasPhoto && !this.showOriginal && this.allLights().length > 0;
   }
 
   /** 灯光改动后的收尾：叠加模式下画面已经实时生效，不需要重跑像素链。 */
   private afterLightEdit(): void {
-    if (this.lightLive()) {
+    if (this.lightLive() || this.filtersOff) {
       this.lightDragOn = false;
       return;
     }
@@ -858,6 +903,10 @@ struct Index {
   /** 切换抽屉页签：灯光只存在于叠加层，像素层不需要重渲染。 */
   private setDrawerTab(index: number): void {
     if (this.drawerTab !== index) {
+      // 离开「重构」时自动应用当前裁切框，避免预览与导出参数不一致。
+      if (this.drawerTab === 1 && this.cropEditing) {
+        this.confirmCrop();
+      }
       this.drawerTab = index;
       this.drawerOpen = true;
       // 进入「滤镜」入口时默认展示胶卷选择。
@@ -891,9 +940,10 @@ struct Index {
 
   /** 双指落点是否落在某一盏灯的范围内（判断捏合是缩灯还是缩图）。 */
   private insideLight(tx: number, ty: number, x: number, y: number, scale: number,
-                      aw: number, ah: number): boolean {
+                      aw: number, ah: number, aspect: number): boolean {
     const dw: number = aw * Math.max(0.01, scale / 100.0);
-    const dh: number = dw / (this.lightAspect > 0 ? this.lightAspect : 1.0);
+    const a: number = aspect > 0 ? aspect : (this.lightAspect > 0 ? this.lightAspect : 1.0);
+    const dh: number = dw / a;
     return Math.abs(tx - x / 100.0 * aw) <= dw / 2.0 &&
       Math.abs(ty - y / 100.0 * ah) <= dh / 2.0;
   }
@@ -902,7 +952,7 @@ struct Index {
   private setLayerScale(id: number, scale: number): void {
     this.lightLayers = this.lightLayers.map((l: LightLayer) => l.id === id
       ? { id: l.id, preset: l.preset, strength: l.strength, scale: scale, x: l.x, y: l.y,
-        rot: l.rot, flipH: l.flipH, flipV: l.flipV } as LightLayer
+        rot: l.rot, flipH: l.flipH, flipV: l.flipV, aspect: l.aspect } as LightLayer
       : l);
   }
 
@@ -923,12 +973,12 @@ struct Index {
       this.lightRot = 0;
       this.lightFlipH = false;
       this.lightFlipV = false;
+      this.lightAspectFree = 0;
       this.afterLightEdit();
       return;
     }
-    const wasOff: boolean = this.filtersOff;
     this.pushUndo();
-    this.leaveOriginal();
+    // 灯光是叠加层，不应该顺手把胶卷/滤镜打开；原图模式下也要能单独加灯。
     this.commitLightDraft();
     this.lightIndex = index;
     this.lightDraft = index > 0;
@@ -936,17 +986,14 @@ struct Index {
       const p: LightPreset = LIGHT_PRESETS[index - 1];
       this.lightStrength = p.strength;
       this.lightScale = p.scale;
+      this.lightAspectFree = 0;
       this.lightX = 0;
       this.lightY = 0;
       this.lightRot = 0;
       this.lightFlipH = false;
       this.lightFlipV = false;
     }
-    if (wasOff) {
-      this.renderPreview();
-    } else {
-      this.afterLightEdit();
-    }
+    this.afterLightEdit();
   }
 
   /** 自动叠加：切换灯光前把面板这一盏并入叠加栈。 */
@@ -957,7 +1004,8 @@ struct Index {
     this.lightLayers.push({
       id: this.layerSeq++, preset: this.lightIndex, strength: this.lightStrength,
       scale: this.lightScale, x: this.lightX, y: this.lightY,
-      rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV
+      rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV,
+      aspect: this.lightAspectFree
     });
     this.lightDraft = false;
   }
@@ -965,16 +1013,14 @@ struct Index {
   /** 画面上每个灯的外框：已入栈的灯和面板里这盏都会出现。 */
   private frameLights(): LightLayer[] {
     const out: LightLayer[] = [];
-    if (this.filtersOff) {
-      return out;
-    }
     for (let i: number = 0; i < this.lightLayers.length; i++) {
       out.push(this.lightLayers[i]);
     }
     if (this.lightDraft && this.lightIndex > 0 && this.lightStrength > 0) {
       out.push({ id: -1, preset: this.lightIndex, strength: this.lightStrength,
         scale: this.lightScale, x: this.lightX, y: this.lightY,
-        rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV });
+        rot: this.lightRot, flipH: this.lightFlipH, flipV: this.lightFlipV,
+        aspect: this.lightAspectFree });
     }
     return out;
   }
@@ -994,21 +1040,174 @@ struct Index {
     return Math.max(44, this.lightAreaW() * Math.max(0.01, l.scale / 100.0));
   }
 
+  /** 外框宽高比：拖动过控制点就用自由比例，否则跟贴图比例。 */
+  private lightFrameAspect(l: LightLayer): number {
+    if (l.aspect !== undefined && l.aspect > 0) {
+      return l.aspect;
+    }
+    return this.lightAspect > 0 ? this.lightAspect : 1.0;
+  }
+
   private lightFrameH(l: LightLayer): number {
-    const a: number = this.lightAspect > 0 ? this.lightAspect : 1.0;
-    return Math.max(44, this.lightFrameW(l) / a);
+    return Math.max(44, this.lightFrameW(l) / this.lightFrameAspect(l));
   }
 
-  /** 角上按钮的横向偏移：外框超出画面时收回到画面内沿，保证按钮始终点得到。 */
+  /** 灯框控制点命中：返回 [图层 id, 0..7]，没命中返回 [-1, -1]。 */
+  private lightHandleHit(mx: number, my: number): number[] {
+    const frames: LightLayer[] = this.frameLights();
+    const aw: number = this.lightAreaW();
+    const ah: number = this.lightAreaH();
+    let out: number[] = [-1, -1];
+    let bestD: number = Number.MAX_VALUE;
+    for (let i: number = 0; i < frames.length; i++) {
+      const l: LightLayer = frames[i];
+      const w: number = this.lightFrameW(l);
+      const h: number = this.lightFrameH(l);
+      const cx: number = l.x / 100.0 * aw;
+      const cy: number = l.y / 100.0 * ah;
+      const rad: number = this.frameRot(l) * Math.PI / 180.0;
+      const cos: number = Math.cos(rad);
+      const sin: number = Math.sin(rad);
+      const dx: number = mx - cx;
+      const dy: number = my - cy;
+      // 换算到灯框本地坐标：旋转过的框也能正确抓到四个角和边中点。
+      const lx: number = dx * cos + dy * sin;
+      const ly: number = -dx * sin + dy * cos;
+      const hw: number = w / 2.0;
+      const hh: number = h / 2.0;
+      // 8 个控制点都可自由缩放：半径收小到 16~26vp，框内中间区域仍留给拖灯。
+      const lim: number = Math.max(16, Math.min(26, Math.min(w, h) * 0.24));
+      const xs: number[] = [-hw, 0, hw, hw, hw, 0, -hw, -hw];
+      const ys: number[] = [-hh, -hh, -hh, 0, hh, hh, hh, 0];
+      for (let k: number = 0; k < 8; k++) {
+        const ddx: number = lx - xs[k];
+        const ddy: number = ly - ys[k];
+        const d: number = ddx * ddx + ddy * ddy;
+        if (d <= lim * lim && d < bestD) {
+          bestD = d;
+          out = [l.id, k];
+        }
+      }
+    }
+    return out;
+  }
+
+  /** 抓住灯框控制点开始自由改宽高：不锁贴图比例、也不锁 1:1。 */
+  private beginLightResize(e: GestureEvent): void {
+    this.lightResizeOn = false;
+    this.lightResizePending = false;
+    if (this.cropEditing || this.wheelOn || this.zoomK > 1.0) {
+      return;
+    }
+    if (e.fingerList.length !== 1) {
+      return;
+    }
+    const mx: number = e.fingerList[0].localX - this.viewW / 2.0;
+    const my: number = e.fingerList[0].localY - this.viewH / 2.0;
+    const hit: number[] = this.lightHandleHit(mx, my);
+    if (hit[1] < 0 || hit[1] > 7) {
+      return;
+    }
+    const target: LightLayer | undefined =
+      this.frameLights().find((l: LightLayer) => l.id === hit[0]);
+    if (target === undefined) {
+      return;
+    }
+    this.lightResizeOn = true;
+    this.lightResizeDirty = false;
+    this.lightResizeId = target.id;
+    this.lightResizeHandle = hit[1];
+    this.lightResizeW = this.lightFrameW(target);
+    this.lightResizeH = this.lightFrameH(target);
+    this.lightResizeCx = target.x / 100.0 * this.lightAreaW();
+    this.lightResizeCy = target.y / 100.0 * this.lightAreaH();
+    this.lightResizeRot = this.frameRot(target);
+    // 抓控制点只改大小，不能同时进入拖灯，否则外框会跟着手指跑。
+    this.lightDragOn = false;
+    this.lightDragType = target.id < 0 ? 0 : 1;
+    this.lightDragLayerId = target.id;
+  }
+
+  /** 控制点拖动：两维独立改宽高，对角保持不动，拖出的比例写回这盏灯。 */
+  private resizeLightFromHandle(mx: number, my: number): void {
+    const aw: number = this.lightAreaW();
+    const ah: number = this.lightAreaH();
+    if (aw <= 1.0 || ah <= 1.0) {
+      return;
+    }
+    const hd: number = this.lightResizeHandle;
+    let sx: number = 0;
+    let sy: number = 0;
+    if (hd === 0 || hd === 6 || hd === 7) {
+      sx = -1;
+    } else if (hd === 2 || hd === 3 || hd === 4) {
+      sx = 1;
+    }
+    if (hd === 0 || hd === 1 || hd === 2) {
+      sy = -1;
+    } else if (hd === 4 || hd === 5 || hd === 6) {
+      sy = 1;
+    }
+    const rad: number = this.lightResizeRot * Math.PI / 180.0;
+    const cos: number = Math.cos(rad);
+    const sin: number = Math.sin(rad);
+    const dx: number = mx - this.lightResizeCx;
+    const dy: number = my - this.lightResizeCy;
+    const lx: number = dx * cos + dy * sin;
+    const ly: number = -dx * sin + dy * cos;
+    const hw0: number = this.lightResizeW / 2.0;
+    const hh0: number = this.lightResizeH / 2.0;
+    const minW: number = 44.0;
+    // 对角边固定：新宽 = 原半宽 + 方向 × 手指标量（角点两个方向同时生效）。
+    let nw: number = this.lightResizeW;
+    let nh: number = this.lightResizeH;
+    if (sx !== 0) {
+      nw = Math.max(minW, Math.min(aw * 4.0, hw0 + sx * lx));
+    }
+    if (sy !== 0) {
+      nh = Math.max(minW, Math.min(ah * 4.0, hh0 + sy * ly));
+    }
+    const ncxL: number = sx === 0 ? 0 : sx * (nw / 2.0 - hw0);
+    const ncyL: number = sy === 0 ? 0 : sy * (nh / 2.0 - hh0);
+    const ncx: number = this.lightResizeCx + ncxL * cos - ncyL * sin;
+    const ncy: number = this.lightResizeCy + ncxL * sin + ncyL * cos;
+    if (Math.abs(nw - this.lightResizeW) < 0.5 && Math.abs(nh - this.lightResizeH) < 0.5 &&
+      Math.abs(ncxL) < 0.5 && Math.abs(ncyL) < 0.5) {
+      return;
+    }
+    this.lightResizeDirty = true;
+    const scale: number = nw / aw * 100.0;
+    const aspect: number = nw / Math.max(1.0, nh);
+    const px: number = Math.max(-50.0, Math.min(50.0, ncx / aw * 100.0));
+    const py: number = Math.max(-50.0, Math.min(50.0, ncy / ah * 100.0));
+    if (this.lightResizeId < 0) {
+      this.lightDraft = true;
+      this.lightScale = scale;
+      this.lightAspectFree = aspect;
+      this.lightX = px;
+      this.lightY = py;
+      return;
+    }
+    const id: number = this.lightResizeId;
+    this.lightLayers = this.lightLayers.map((l: LightLayer) => l.id === id
+      ? { id: l.id, preset: l.preset, strength: l.strength, scale: scale,
+        x: px, y: py, rot: l.rot, flipH: l.flipH, flipV: l.flipV,
+        aspect: aspect } as LightLayer
+      : l);
+  }
+
+  /** 角上按钮的横向偏移：贴住外框右边缘，只有会跑出画布时才往回收。 */
   private frameBtnDx(l: LightLayer): number {
-    const half: number = this.lightAreaW() / 2.0 - 14;
-    return Math.min(this.lightFrameW(l) / 2.0, Math.max(0, half));
+    const cx: number = Math.abs(l.x / 100.0 * this.lightAreaW());
+    const room: number = Math.max(0, this.viewW / 2.0 - 16.0 - cx);
+    return Math.min(this.lightFrameW(l) / 2.0, room);
   }
 
-  /** 角上按钮的纵向偏移，规则同 frameBtnDx。 */
+  /** 角上按钮的纵向偏移，规则同 frameBtnDx：贴住外框上/下边缘。 */
   private frameBtnDy(l: LightLayer): number {
-    const half: number = this.lightAreaH() / 2.0 - 14;
-    return Math.min(this.lightFrameH(l) / 2.0, Math.max(0, half));
+    const cy: number = Math.abs(l.y / 100.0 * this.lightAreaH());
+    const room: number = Math.max(0, this.viewH / 2.0 - 16.0 - cy);
+    return Math.min(this.lightFrameH(l) / 2.0, room);
   }
 
   /** 外框上的 × ：删掉这盏灯（id<0 表示面板里还没入栈的草稿）。 */
@@ -1020,6 +1219,7 @@ struct Index {
       this.lightRot = 0;
       this.lightFlipH = false;
       this.lightFlipV = false;
+      this.lightAspectFree = 0;
       this.afterLightEdit();
       return;
     }
@@ -1041,7 +1241,8 @@ struct Index {
       const l: LightLayer = this.lightLayers[i];
       if (l.id === id) {
         out.push({ id: l.id, preset: l.preset, strength: l.strength, scale: l.scale,
-          x: l.x, y: l.y, rot: angle, flipH: l.flipH, flipV: l.flipV });
+          x: l.x, y: l.y, rot: angle, flipH: l.flipH, flipV: l.flipV,
+          aspect: l.aspect });
       } else {
         out.push(l);
       }
@@ -1092,7 +1293,8 @@ struct Index {
     } else {
       this.lightLayers = this.lightLayers.map((l: LightLayer) => l.id === id
         ? { id: l.id, preset: l.preset, strength: l.strength, scale: l.scale,
-          x: l.x, y: l.y, rot: angle, flipH: l.flipH, flipV: l.flipV } as LightLayer
+          x: l.x, y: l.y, rot: angle, flipH: l.flipH, flipV: l.flipV,
+          aspect: l.aspect } as LightLayer
         : l);
     }
     this.afterLightEdit();
@@ -1124,6 +1326,7 @@ struct Index {
     this.lightIndex = hit.preset;
     this.lightStrength = hit.strength;
     this.lightScale = hit.scale;
+    this.lightAspectFree = hit.aspect !== undefined ? hit.aspect : 0;
     this.lightX = hit.x;
     this.lightY = hit.y;
     this.lightRot = hit.rot;
@@ -1398,6 +1601,13 @@ struct Index {
   private pinchBaseScale: number = 45;
   private pinchWhiteOn: boolean = false;
   private pinchBaseWhite: number = 0.8;
+  /** 捏合起始时的平移与双指中心：用于「以手指为锚点缩放 + 双指拖动画面」。 */
+  private pinchBasePanX: number = 0;
+  private pinchBasePanY: number = 0;
+  private pinchCenterX: number = 0;
+  private pinchCenterY: number = 0;
+  /** 本次触摸序列是否发生过拖动：拖动抬手不能被当成单击而复位缩放。 */
+  private canvasDragged: boolean = false;
   private basePanX: number = 0;
   /** 拖动目标：0 = 面板正在调的那盏，1 = 已存灯光图层。 */
   private lightDragType: number = 0;
@@ -1410,6 +1620,19 @@ struct Index {
   @State lightRotDragId: number = 999;
   @State lightRotDragAngle: number = 0;
   private lightRotDragBase: number = 0;
+  /** 灯框控制点拖动：抓起时的基准宽高/中心/角度，拖动期间不改这些基准。 */
+  private lightResizeOn: boolean = false;
+  /** onActionStart 拿不到 fingerList 时，等第一次 update 再判定控制点。 */
+  private lightResizePending: boolean = false;
+  private lightResizeId: number = -1;
+  private lightResizeHandle: number = -1;
+  private lightResizeW: number = 0;
+  private lightResizeH: number = 0;
+  private lightResizeCx: number = 0;
+  private lightResizeCy: number = 0;
+  private lightResizeRot: number = 0;
+  /** 本次按住控制点是否真的移动过；没动就不重渲染（点 ✕/⟳ 时不至于卡一下）。 */
+  private lightResizeDirty: boolean = false;
   private lightAspect: number = 1.0;
   /** Committed on release; dragging never rewrites the light @State. */
   private lightPendingX: number = 0;
@@ -1420,6 +1643,9 @@ struct Index {
   private basePanY: number = 0;
   private cropBaseX: number = 0.5;
   private cropBaseY: number = 0.5;
+  private cropFrameBaseX: number = 0;
+  private cropFrameBaseY: number = 0;
+  private cropScaling: boolean = false;
   private viewW: number = 0;
   private viewH: number = 0;
   /** 一多断点：xs<320 / sm<600 / md<840 / lg<1440 / xl>=1440（单位 vp）。 */
@@ -1488,9 +1714,12 @@ struct Index {
     this.lutLayers = [];
     this.lightLayers = [];
     await this.loadPhoto(uri);
-    this.filtersOff = false;
-    this.filmDraft = true;
-    await this.renderPreview();
+    // 只有拍摄链路明确带了胶卷/相纸才套用；相册导入一律先停留在原图直通。
+    if (this.pendingFilmId.length > 0 || this.pendingPaperId.length > 0) {
+      this.filtersOff = false;
+      this.filmDraft = true;
+      await this.renderPreview();
+    }
   }
 
   /** 断点判定：返回当前窗口宽度所属档位。 */
@@ -1582,6 +1811,19 @@ struct Index {
       this.panX = 0;
       this.panY = 0;
     }
+  }
+
+  /**
+   * 双指中心的局部坐标（相对画布中心，单位 vp）。
+   * 手指信息缺失时回落到 0（画布中心），保证公式不会把画面甩飞。
+   */
+  private pinchFocus(e: GestureEvent, axis: number): number {
+    if (e.fingerList.length >= 2) {
+      const a: number = axis === 0 ? e.fingerList[0].localX : e.fingerList[0].localY;
+      const b: number = axis === 0 ? e.fingerList[1].localX : e.fingerList[1].localY;
+      return (a + b) / 2.0 - (axis === 0 ? this.viewW : this.viewH) / 2.0;
+    }
+    return 0;
   }
 
   /** 读取本地记录的同意状态：没同意过就先弹隐私政策，同意后再加载素材。 */
@@ -1903,6 +2145,13 @@ struct Index {
       this.cropY = 0.5;
       this.cropDx = 0;
       this.cropDy = 0;
+      this.cropEditing = false;
+      this.cropFrameDx = 0;
+      this.cropFrameDy = 0;
+      this.cropZoom = 1.0;
+      this.cropRatio = 0;
+      this.cropFrameW = 0;
+      this.cropFrameH = 0;
       this.hasPhoto = true;
       // 新照片先按「原图」显示：胶卷/相纸属于创作选择，必须由用户主动挑选后才应用。
       this.filtersOff = true;
@@ -1954,12 +2203,16 @@ struct Index {
     if (this.straighten > 0.05 || this.straighten < -0.05) {
       g = straighten(g.src, g.w, g.h, this.straighten);
     }
+    if (this.perspH > 0.5 || this.perspH < -0.5 ||
+      this.perspV > 0.5 || this.perspV < -0.5) {
+      g = perspective(g.src, g.w, g.h, this.perspH, this.perspV);
+    }
     return g;
   }
 
   /** Crop to the chosen aspect ratio; aspect 0 keeps the whole frame. */
   private cropTo(src: Uint8Array, w: number, h: number, aspect: number,
-                 cx: number, cy: number): CropResult {
+                 cx: number, cy: number, zoom: number): CropResult {
     if (aspect <= 0.0) {
       return { src: src, w: w, h: h };
     }
@@ -1970,6 +2223,9 @@ struct Index {
     } else {
       ch = Math.round(w / aspect);
     }
+    const z: number = zoom > 0.0 ? Math.max(0.05, Math.min(1.0, zoom)) : 1.0;
+    cw = Math.round(cw * z);
+    ch = Math.round(ch * z);
     cw = Math.max(2, cw - (cw % 2));
     ch = Math.max(2, ch - (ch % 2));
     const x0: number = Math.max(0, Math.min(w - cw, Math.round((w - cw) * cx)));
@@ -2127,7 +2383,13 @@ struct Index {
   private applyPost(pixels: Uint8Array, w: number, h: number,
                     tex: EdgeTexture | null, lights: PostLight[]): PostResult {
     if (this.filtersOff) {
-      return { pixels: pixels, w: w, h: h, stageMs: 'original' };
+      for (let i = 0; i < lights.length; i++) {
+        const L: PostLight = lights[i];
+        applyLightLayer(pixels, w, h, L.tex, L.w, L.h, L.opacity, L.scale,
+          L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV,
+          L.aspect !== undefined ? L.aspect : 0);
+      }
+      return { pixels: pixels, w: w, h: h, stageMs: 'light-only' };
     }
     addHalationGlare(pixels, w, h, this.halation / 100.0, this.glare / 30.0);
     addScatter(pixels, w, h, this.scatter / 100.0);
@@ -2155,7 +2417,8 @@ struct Index {
     for (let i = 0; i < lights.length; i++) {
       const L: PostLight = lights[i];
       applyLightLayer(pixels, w, h, L.tex, L.w, L.h, L.opacity, L.scale,
-        L.offX, L.offY, L.gain);
+        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV,
+        L.aspect !== undefined ? L.aspect : 0);
     }
     let edge: EdgeResult;
     if (tex === null) {
@@ -2187,10 +2450,8 @@ struct Index {
    * task-pool transfer detaches the caller's buffer.
    */
   private async prepare(src: Uint8Array, w: number, h: number, maxEdge: number): Promise<GeoResult> {
-    // 「原图」不裁剪、不旋转、不校正，直接给原始像素。
-    if (this.filtersOff) {
-      return { src: src, w: w, h: h };
-    }
+    // 「原图」只跳过后期调色，几何（旋转/裁切/透视/校正）必须照常执行，
+    // 否则在原图模式下切画幅、确认裁切都会静默失效。
     const longEdge: number = w > h ? w : h;
     const needsScale: boolean = maxEdge > 0 && longEdge > maxEdge;
     // Identity geometry: hand the caller's buffer straight back. Copying a
@@ -2199,22 +2460,26 @@ struct Index {
     if (Math.round(this.rotation / 90.0) % 4 === 0 && !this.flipH && !this.flipV &&
       this.lensCorrection > -0.5 && this.lensCorrection < 0.5 &&
       this.straighten > -0.05 && this.straighten < 0.05 &&
-      this.effAspect() <= 0 && !needsScale) {
+      this.perspH > -0.5 && this.perspH < 0.5 &&
+      this.perspV > -0.5 && this.perspV < 0.5 &&
+      this.previewAspect() <= 0 && !needsScale) {
       return { src: src, w: w, h: h };
     }
     const payload: GeometryPayload = {
       src: src.slice(), w: w, h: h,
       rotation: this.rotation, flipH: this.flipH, flipV: this.flipV,
       lens: this.lensCorrection / 100.0, straightenDeg: this.straighten,
-      aspect: this.effAspect(), cropX: this.cropX, cropY: this.cropY, maxEdge: maxEdge
+      perspH: this.perspH, perspV: this.perspV,
+      aspect: this.previewAspect(), cropX: this.cropX, cropY: this.cropY,
+      cropZoom: this.cropZoom, maxEdge: maxEdge
     };
     try {
       return (await taskpool.execute(new taskpool.Task(geometryTask, payload))) as GeoResult;
     } catch (e) {
       console.warn('taskpool geometry unavailable, using main thread');
       let g: GeoResult = this.geometry(src, w, h);
-      const c: CropResult = this.cropTo(g.src, g.w, g.h, this.effAspect(),
-        this.cropX, this.cropY);
+      const c: CropResult = this.cropTo(g.src, g.w, g.h, this.previewAspect(),
+        this.cropX, this.cropY, this.cropZoom);
       g = { src: c.src, w: c.w, h: c.h };
       if (maxEdge > 0) {
         const longEdge: number = g.w > g.h ? g.w : g.h;
@@ -2248,22 +2513,7 @@ struct Index {
         strength: this.filters[entry.index].strength * entry.strength / 100.0
       });
     }
-    const lights: PostLight[] = [];
-    const savedLights: LightLayer[] = withLights ? this.allLights() : [];
-    for (let i = 0; i < savedLights.length; i++) {
-      const entry: LightLayer = savedLights[i];
-      const lt: LightTexture | null = await this.ensureLightTexture(entry.preset);
-      if (lt === null) {
-        continue;
-      }
-      lights.push({
-        tex: lt.data.slice(), w: lt.w, h: lt.h,
-        opacity: entry.strength / 100.0,
-        scale: Math.max(0.01, entry.scale / 100.0),
-        offX: entry.x / 100.0, offY: entry.y / 100.0, gain: lt.gain,
-        rot: entry.rot, flipH: entry.flipH, flipV: entry.flipV
-      });
-    }
+    const lights: PostLight[] = withLights ? await this.buildPostLights() : [];
     const payload: PostPayload = {
       pixels: pixels, w: w, h: h,
       halation: this.halation / 100.0, glare: this.glare / 30.0,
@@ -2285,11 +2535,50 @@ struct Index {
   }
 
   /** The whole post chain as one task-pool job; returns the processed buffer. */
+  /** 把当前所有灯光图层整理成渲染参数（已存图层 + 面板这盏）。 */
+  private async buildPostLights(): Promise<PostLight[]> {
+    const lights: PostLight[] = [];
+    const savedLights: LightLayer[] = this.allLights();
+    for (let i = 0; i < savedLights.length; i++) {
+      const entry: LightLayer = savedLights[i];
+      const lt: LightTexture | null = await this.ensureLightTexture(entry.preset);
+      if (lt === null) {
+        continue;
+      }
+      lights.push({
+        tex: lt.data.slice(), w: lt.w, h: lt.h,
+        opacity: entry.strength / 100.0,
+        scale: Math.max(0.01, entry.scale / 100.0),
+        offX: entry.x / 100.0, offY: entry.y / 100.0, gain: lt.gain,
+        rot: entry.rot, flipH: entry.flipH, flipV: entry.flipV,
+        aspect: entry.aspect !== undefined ? entry.aspect : 0
+      });
+    }
+    return lights;
+  }
+
   private async applyPostAsync(pixels: Uint8Array, w: number, h: number,
                                tex: EdgeTexture | null): Promise<PostResult> {
-    // 「原图」跳过整条后期链：没有眩光/散射/暗角/色调/LUT/片边/日期。
+    // 「原图」跳过整条后期链：没有眩光/散射/暗角/色调/LUT/片边/日期；
+    // 但用户主动加的灯光属于叠加内容，必须照常烘焙，否则导出会丢灯。
     if (this.filtersOff) {
-      return { pixels: pixels, w: w, h: h, stageMs: 'original' };
+      const onlyLights: PostLight[] = await this.buildPostLights();
+      if (onlyLights.length === 0) {
+        return { pixels: pixels, w: w, h: h, stageMs: 'original' };
+      }
+      const lp: PostPayload = await this.buildPostPayload(pixels, w, h, null, true);
+      try {
+        return (await taskpool.execute(new taskpool.Task(lightTask, lp))) as PostResult;
+      } catch (e) {
+        console.warn('taskpool light unavailable, using main thread');
+        for (let i = 0; i < onlyLights.length; i++) {
+          const L: PostLight = onlyLights[i];
+          applyLightLayer(pixels, w, h, L.tex, L.w, L.h, L.opacity, L.scale,
+            L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV,
+            L.aspect !== undefined ? L.aspect : 0);
+        }
+        return { pixels: pixels, w: w, h: h, stageMs: 'light-only' };
+      }
     }
     const payload: PostPayload = await this.buildPostPayload(pixels, w, h, tex);
     try {
@@ -2347,7 +2636,8 @@ struct Index {
     for (let i = 0; i < p.lights.length; i++) {
       const L: PostLight = p.lights[i];
       applyLightLayer(p.pixels, p.w, p.h, L.tex, L.w, L.h, L.opacity, L.scale,
-        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV);
+        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV,
+        L.aspect !== undefined ? L.aspect : 0);
     }
     let edge: EdgeResult;
     if (p.edgeTex !== undefined && p.edgeW !== undefined && p.edgeH !== undefined &&
@@ -2434,18 +2724,312 @@ struct Index {
     return this.aspect;
   }
 
-  /** How far the crop window can travel, in pre-crop pixels. */
-  private cropShiftPx(): number[] {
-    const iw: number = this.previewW;
-    const ih: number = this.previewH;
-    const a: number = this.effAspect();
-    if (a <= 0.0 || iw <= 0 || ih <= 0) {
-      return [0, 0];
+  /**
+   * 裁切编辑态下预览必须显示完整画面，几何阶段因此按「不裁切」出图，
+   * 最终裁剪区域由画布上的裁切框表达，避免拖动时反复跑像素渲染。
+   */
+  private previewAspect(): number {
+    return this.cropEditing ? 0.0 : this.effAspect();
+  }
+
+  /** 当前显示方向下照片的像素尺寸：[宽, 高]。 */
+  private cropFrameImg(): number[] {
+    const sideways: boolean = this.rotation === 90 || this.rotation === 270;
+    return [sideways ? this.previewH : this.previewW,
+      sideways ? this.previewW : this.previewH];
+  }
+
+  /** 裁切框比例：自由模式用拖动出的比例，否则跟随当前画幅。 */
+  private frameAspect(): number {
+    return this.cropRatio > 0.0 ? this.cropRatio : this.effAspect();
+  }
+
+  /** 画幅可用的最大裁切框（未乘缩放）：[框宽, 框高, 画面宽, 画面高]，屏幕 vp。 */
+  private cropGeomMax(): number[] {
+    const img: number[] = this.cropFrameImg();
+    const iw: number = img[0];
+    const ih: number = img[1];
+    if (iw <= 0 || ih <= 0 || this.viewW <= 0 || this.viewH <= 0) {
+      return [0, 0, 0, 0];
     }
-    if (iw / ih > a) {
-      return [Math.max(0, (iw - ih * a) / 2), 0];
+    const fit: number = Math.min(this.viewW / iw, this.viewH / ih) * this.cropViewScale();
+    const dw: number = iw * fit;
+    const dh: number = ih * fit;
+    const a: number = this.frameAspect();
+    let bw: number = dw;
+    let bh: number = dh;
+    if (a > 0.0) {
+      if (dw / dh > a) {
+        bw = dh * a;
+      } else {
+        bh = dw / a;
+      }
     }
-    return [0, Math.max(0, (ih - iw / a) / 2)];
+    return [bw, bh, dw, dh];
+  }
+
+  /** 进入编辑态时取整幅画面做裁切框。 */
+  private initCropFrame(): void {
+    const g: number[] = this.cropGeomMax();
+    this.cropFrameW = g[0];
+    this.cropFrameH = g[1];
+  }
+
+  /** 裁切编辑时画面整体缩小到 86%，左右边框远离屏幕边缘，方便抓取。 */
+  private cropViewScale(): number {
+    return this.cropEditing ? 0.86 : 1.0;
+  }
+
+  private cropBw(): number {
+    return this.cropFrameW;
+  }
+
+  private cropBh(): number {
+    return this.cropFrameH;
+  }
+
+  private cropDw(): number {
+    return this.cropGeomMax()[2];
+  }
+
+  private cropDh(): number {
+    return this.cropGeomMax()[3];
+  }
+
+  /** 进入裁切编辑：预览改为完整画面，拖动只改框、不跑像素渲染。 */
+  private beginCropEdit(): void {
+    this.cropEditing = true;
+    this.cropRatio = this.aspectId === 'custom' && this.aspect > 0.0 ? this.aspect : 0.0;
+    this.cropFrameDx = 0;
+    this.cropFrameDy = 0;
+    this.cropZoom = 1.0;
+    this.cropX = 0.5;
+    this.cropY = 0.5;
+    this.cropScaling = false;
+    this.cropHandle = -1;
+    this.initCropFrame();
+    this.zoomK = 1.0;
+    this.panX = 0;
+    this.panY = 0;
+    this.cropDx = 0;
+    this.cropDy = 0;
+    this.canvasDragged = false;
+    this.renderPreview();
+  }
+
+  /** 把裁切框换算成裁切参数；不触发渲染，供确认与离开页签复用。 */
+  private applyCropFrame(): void {
+    if (!this.cropEditing) {
+      return;
+    }
+    const img: number[] = this.cropFrameImg();
+    const bw: number = this.cropFrameW;
+    const bh: number = this.cropFrameH;
+    if (this.cropRatio > 0.0 && bw > 0.0 && bh > 0.0) {
+      // 自由比例：框的实际宽高比成为新的画幅比例，导出按同一比例裁切。
+      this.aspect = bw / bh;
+      this.cropRatio = this.aspect;
+      this.aspectId = 'custom';
+    }
+    const g: number[] = this.cropGeomMax();
+    if (img[0] <= 0 || img[1] <= 0 || g[2] <= 0 || bw <= 0 || bh <= 0) {
+      this.cropX = 0.5;
+      this.cropY = 0.5;
+    } else {
+      const s: number = g[2] / img[0];
+      const cw: number = bw / s;
+      const ch: number = bh / s;
+      const roomX: number = img[0] - cw;
+      const roomY: number = img[1] - ch;
+      const x0: number = img[0] / 2 + this.cropFrameDx / s - cw / 2;
+      const y0: number = img[1] / 2 + this.cropFrameDy / s - ch / 2;
+      this.cropX = roomX > 0.5 ? Math.max(0.0, Math.min(1.0, x0 / roomX)) : 0.5;
+      this.cropY = roomY > 0.5 ? Math.max(0.0, Math.min(1.0, y0 / roomY)) : 0.5;
+      this.cropZoom = Math.max(0.05, Math.min(1.0, bw / Math.max(1.0, g[0])));
+    }
+    this.cropEditing = false;
+    this.cropFrameDx = 0;
+    this.cropFrameDy = 0;
+    this.cropScaling = false;
+    this.cropHandle = -1;
+  }
+
+  /** 确认裁切：只在这里跑一次全量渲染。 */
+  private confirmCrop(): void {
+    if (!this.cropEditing) {
+      return;
+    }
+    this.applyCropFrame();
+    this.renderPreview();
+  }
+
+  private resetCropBox(): void {
+    if (this.cropEditing) {
+      this.cropFrameDx = 0;
+      this.cropFrameDy = 0;
+      this.cropRatio = this.aspectId === 'custom' && this.aspect > 0.0 ? this.aspect : 0.0;
+      this.initCropFrame();
+      return;
+    }
+    this.cropX = 0.5;
+    this.cropY = 0.5;
+    this.cropZoom = 1.0;
+    this.renderPreview();
+  }
+
+  /** 自由比例只在普通画幅下开放：胶片齿孔锁死了片门比例。 */
+  private canFreeCrop(): boolean {
+    return !(this.filmEdge && !this.filtersOff);
+  }
+
+  /** 命中的控制点：0..7 从左上涨顺时针，8 = 框内，-1 = 空。 */
+  private cropHandleAt(e: GestureEvent): number {
+    if (!this.cropEditing || e.fingerList.length < 1) {
+      return -1;
+    }
+    const mx: number = e.fingerList[0].localX - this.viewW / 2 - this.cropFrameDx;
+    const my: number = e.fingerList[0].localY - this.viewH / 2 - this.cropFrameDy;
+    const hw: number = this.cropFrameW / 2;
+    const hh: number = this.cropFrameH / 2;
+    const xs: number[] = [-hw, 0, hw, hw, hw, 0, -hw, -hw];
+    const ys: number[] = [-hh, -hh, -hh, 0, hh, hh, hh, 0];
+    let best: number = -1;
+    let bestD: number = 48 * 48;
+    for (let i: number = 0; i < 8; i++) {
+      const dx: number = mx - xs[i];
+      const dy: number = my - ys[i];
+      const d: number = dx * dx + dy * dy;
+      if (d <= bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    if (best >= 0) {
+      return best;
+    }
+    return Math.abs(mx) <= hw && Math.abs(my) <= hh ? 8 : -1;
+  }
+
+  /** 拖动控制点：固定比例等比缩放，自由比例可任意改变宽高。 */
+  private resizeCropFromHandle(handle: number, mx: number, my: number): void {
+    const g: number[] = this.cropGeomMax();
+    const dw: number = g[2];
+    const dh: number = g[3];
+    if (dw <= 1.0 || dh <= 1.0) {
+      return;
+    }
+    let sx: number = 0;
+    let sy: number = 0;
+    if (handle === 0 || handle === 6 || handle === 7) {
+      sx = -1;
+    } else if (handle === 2 || handle === 3 || handle === 4) {
+      sx = 1;
+    }
+    if (handle === 0 || handle === 1 || handle === 2) {
+      sy = -1;
+    } else if (handle === 4 || handle === 5 || handle === 6) {
+      sy = 1;
+    }
+    const cx: number = this.cropFrameDx;
+    const cy: number = this.cropFrameDy;
+    const ax: number = sx === 0 ? cx : cx - sx * this.cropFrameW / 2;
+    const ay: number = sy === 0 ? cy : cy - sy * this.cropFrameH / 2;
+    let maxW: number = dw;
+    let maxH: number = dh;
+    if (sx > 0) {
+      maxW = dw / 2 - ax;
+    } else if (sx < 0) {
+      maxW = ax + dw / 2;
+    }
+    if (sy > 0) {
+      maxH = dh / 2 - ay;
+    } else if (sy < 0) {
+      maxH = ay + dh / 2;
+    }
+    const r: number = this.frameAspect();
+    const lock: boolean = this.cropRatio <= 0.0 && r > 0.0;
+    let nw: number = sx === 0 ? this.cropFrameW : Math.abs(mx - ax);
+    let nh: number = sy === 0 ? this.cropFrameH : Math.abs(my - ay);
+    const minW: number = 56.0;
+    if (lock) {
+      if (sx !== 0 && sy !== 0) {
+        // 角点按主导方向换算，保证跟手。
+        if (nw / r >= nh) {
+          nh = nw / r;
+        } else {
+          nw = nh * r;
+        }
+        const k: number = Math.min(1.0, Math.min(maxW / Math.max(1.0, nw),
+          maxH / Math.max(1.0, nh)));
+        nw *= k;
+        nh *= k;
+      } else if (sx !== 0) {
+        nh = nw / r;
+        const room: number = Math.max(0.0, dh / 2 - Math.abs(cy)) * 2.0 * r;
+        nw = Math.min(nw, Math.min(maxW, room));
+        nh = nw / r;
+      } else {
+        nw = nh * r;
+        const room: number = Math.max(0.0, dw / 2 - Math.abs(cx)) * 2.0 / r;
+        nh = Math.min(nh, Math.min(maxH, room));
+        nw = nh * r;
+      }
+      if (nw < minW) {
+        nw = minW;
+        nh = nw / r;
+      }
+    } else {
+      // 自由比例：两维独立，拖出一个任意宽高比。
+      nw = Math.max(minW, Math.min(Math.max(minW, maxW), nw));
+      nh = Math.max(minW, Math.min(Math.max(minW, maxH), nh));
+    }
+    let ncx: number = cx;
+    let ncy: number = cy;
+    if (sx !== 0) {
+      ncx = ax + sx * nw / 2.0;
+    }
+    if (sy !== 0) {
+      ncy = ay + sy * nh / 2.0;
+    }
+    this.cropFrameW = nw;
+    this.cropFrameH = nh;
+    this.cropFrameDx = ncx;
+    this.cropFrameDy = ncy;
+  }
+
+  /** 当前画幅比例文案：自由模式显示拖动出的真实比例。 */
+  private aspectLabel(): string {
+    if (this.aspectId === 'custom') {
+      const r: number = this.cropEditing && this.cropFrameH > 0.5
+        ? this.cropFrameW / this.cropFrameH : this.frameAspect();
+      return this.t('自由 ', 'FREE ') + r.toFixed(2);
+    }
+    if (this.aspect <= 0.0) {
+      return this.t('原图比例', 'ORIGINAL');
+    }
+    return this.aspect.toFixed(2);
+  }
+
+  /** 旋转滑杆的总角度：90° 步进 + 校平残差合成任意角度。 */
+  private totalRotate(): number {
+    let d: number = this.rotation + this.straighten;
+    while (d > 180.0) {
+      d -= 360.0;
+    }
+    while (d <= -180.0) {
+      d += 360.0;
+    }
+    return d;
+  }
+
+  private setTotalRotate(deg: number): void {
+    const turns: number = Math.round(deg / 90.0);
+    this.straighten = deg - turns * 90.0;
+    let q: number = turns % 4;
+    if (q < 0) {
+      q += 4;
+    }
+    this.rotation = q * 90;
   }
 
   /** Display pixels per image pixel for the current preview. */
@@ -2497,7 +3081,9 @@ struct Index {
   /** 预览几何参数签名：任何影响旋转/裁剪/缩放的改动都会换键。 */
   private geoSignature(): string {
     return [this.photoGen, this.rotation, this.flipH ? 1 : 0, this.flipV ? 1 : 0,
-      this.lensCorrection, this.straighten, this.effAspect(), this.cropX, this.cropY,
+      this.lensCorrection, this.straighten, this.perspH, this.perspV,
+      this.previewAspect(), this.cropX, this.cropY,
+      this.cropZoom,
       this.filtersOff ? 1 : 0, this.previewW, this.previewH].join(',');
   }
 
@@ -3099,8 +3685,6 @@ struct Index {
         .fontSize(9)
         .fontColor(Theme.secondary)
         .padding({ left: 7, right: 7, top: 4, bottom: 4 })
-        .border({ width: 1, color: Theme.rule })
-        .borderRadius(2)
         .onClick(() => {
           this.lang = this.lang === 'zh' ? 'en' : 'zh';
         })
@@ -3119,6 +3703,7 @@ struct Index {
         .height(22)
         .objectFit(ImageFit.Contain)
         .opacity(this.hasPhoto && !this.busy ? 1.0 : 0.4)
+        .id('exportBtn')
       .margin({ left: 2, right: 2 })
       .opacity(this.hasPhoto && !this.busy ? 1.0 : 0.45)
       .onClick(() => {
@@ -3569,13 +4154,166 @@ struct Index {
       .padding({ left: 8, right: 8, top: 4, bottom: 4 })
       .margin({ right: 6, bottom: 4 })
       .onClick(() => {
-        this.leaveOriginal();
         this.aspect = value;
         this.aspectId = id;
+        this.cropRatio = 0.0;
         this.cropX = 0.5;
         this.cropY = 0.5;
-        this.renderPreview();
+        this.cropFrameDx = 0;
+        this.cropFrameDy = 0;
+        if (value > 0.0) {
+          this.beginCropEdit();
+        } else {
+          this.cropEditing = false;
+          this.renderPreview();
+        }
       })
+  }
+
+  /** 自定义比例：进入自由裁切，拖 8 个控制点可得到任意宽高比。 */
+  @Builder
+  customChip() {
+    Text(this.t('自由', 'FREE'))
+      .fontSize(9)
+      .fontColor(this.aspectId === 'custom' ? Theme.accent : Theme.secondary)
+      .backgroundColor(this.aspectId === 'custom' ? Theme.cardRaised : Theme.card)
+      .border({ width: 1, color: this.aspectId === 'custom' ? Theme.accent : Theme.rule })
+      .borderRadius(2)
+      .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+      .margin({ right: 6, bottom: 4 })
+      .onClick(() => {
+        const img: number[] = this.cropFrameImg();
+        let a: number = this.effAspect();
+        if (a <= 0.0) {
+          a = img[1] > 0 ? img[0] / img[1] : 1.0;
+        }
+        this.aspect = a;
+        this.aspectId = 'custom';
+        this.cropRatio = a;
+        this.cropX = 0.5;
+        this.cropY = 0.5;
+        this.cropFrameDx = 0;
+        this.cropFrameDy = 0;
+        this.beginCropEdit();
+      })
+  }
+
+  /** 裁切编辑态的画布叠加：框外压暗 + 参考线 + 8 个控制点。 */
+  @Builder
+  cropOverlay() {
+    Stack({ alignContent: Alignment.Center }) {
+      // 框外压暗：四条遮罩跟随裁切框。
+      Rect()
+        .width(Math.max(0, this.cropFrameDx - this.cropFrameW / 2 + this.cropDw() / 2))
+        .height(this.cropDh())
+        .fill('#B3000000')
+        .translate({ x: (this.cropFrameDx - this.cropFrameW / 2 - this.cropDw() / 2) / 2, y: 0 })
+        .hitTestBehavior(HitTestMode.None)
+      Rect()
+        .width(Math.max(0, this.cropDw() / 2 - this.cropFrameDx - this.cropFrameW / 2))
+        .height(this.cropDh())
+        .fill('#B3000000')
+        .translate({ x: (this.cropFrameDx + this.cropFrameW / 2 + this.cropDw() / 2) / 2, y: 0 })
+        .hitTestBehavior(HitTestMode.None)
+      Rect()
+        .width(this.cropFrameW)
+        .height(Math.max(0, this.cropFrameDy - this.cropFrameH / 2 + this.cropDh() / 2))
+        .fill('#B3000000')
+        .translate({ x: this.cropFrameDx,
+          y: (this.cropFrameDy - this.cropFrameH / 2 - this.cropDh() / 2) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Rect()
+        .width(this.cropFrameW)
+        .height(Math.max(0, this.cropDh() / 2 - this.cropFrameDy - this.cropFrameH / 2))
+        .fill('#B3000000')
+        .translate({ x: this.cropFrameDx,
+          y: (this.cropFrameDy + this.cropFrameH / 2 + this.cropDh() / 2) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      // 三分构图参考线。
+      Rect()
+        .width(1).height(this.cropFrameH).fill('#3DFFFFFF')
+        .translate({ x: this.cropFrameDx - this.cropFrameW / 6, y: this.cropFrameDy })
+        .hitTestBehavior(HitTestMode.None)
+      Rect()
+        .width(1).height(this.cropFrameH).fill('#3DFFFFFF')
+        .translate({ x: this.cropFrameDx + this.cropFrameW / 6, y: this.cropFrameDy })
+        .hitTestBehavior(HitTestMode.None)
+      Rect()
+        .width(this.cropFrameW).height(1).fill('#3DFFFFFF')
+        .translate({ x: this.cropFrameDx, y: this.cropFrameDy - this.cropFrameH / 6 })
+        .hitTestBehavior(HitTestMode.None)
+      Rect()
+        .width(this.cropFrameW).height(1).fill('#3DFFFFFF')
+        .translate({ x: this.cropFrameDx, y: this.cropFrameDy + this.cropFrameH / 6 })
+        .hitTestBehavior(HitTestMode.None)
+      Column()
+        .width(this.cropFrameW)
+        .height(this.cropFrameH)
+        .border({ width: 1.5, color: '#FFFFFF' })
+        .translate({ x: this.cropFrameDx, y: this.cropFrameDy })
+        .hitTestBehavior(HitTestMode.None)
+      // 四个角：边框加粗并向内侧延伸成直角。
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx - this.cropFrameW / 2 + 10,
+          y: this.cropFrameDy - this.cropFrameH / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx - this.cropFrameW / 2,
+          y: this.cropFrameDy - this.cropFrameH / 2 + 10 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx + this.cropFrameW / 2 - 10,
+          y: this.cropFrameDy - this.cropFrameH / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx + this.cropFrameW / 2,
+          y: this.cropFrameDy - this.cropFrameH / 2 + 10 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx - this.cropFrameW / 2 + 10,
+          y: this.cropFrameDy + this.cropFrameH / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx - this.cropFrameW / 2,
+          y: this.cropFrameDy + this.cropFrameH / 2 - 10 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx + this.cropFrameW / 2 - 10,
+          y: this.cropFrameDy + this.cropFrameH / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx + this.cropFrameW / 2,
+          y: this.cropFrameDy + this.cropFrameH / 2 - 10 })
+        .hitTestBehavior(HitTestMode.None)
+      // 四条边中点。
+      Row()
+        .width(18).height(4).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx, y: this.cropFrameDy - this.cropFrameH / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(4).height(18).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx + this.cropFrameW / 2, y: this.cropFrameDy })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(18).height(4).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx, y: this.cropFrameDy + this.cropFrameH / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(4).height(18).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.cropFrameDx - this.cropFrameW / 2, y: this.cropFrameDy })
+        .hitTestBehavior(HitTestMode.None)
+    }
+    .width('100%')
+    .height('100%')
+    .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -3647,6 +4385,7 @@ struct Index {
     .justifyContent(FlexAlign.Center)
     .height(52)
     .layoutWeight(1)
+    .id('tab_' + index)
     .onClick(() => {
       this.setDrawerTab(index);
     })
@@ -3876,6 +4615,7 @@ struct Index {
       .fontColor(this.lightIndex === index ? Theme.accent : Theme.secondary)
       .padding({ top: 4, bottom: 4 })
       .margin({ right: 14, bottom: 4 })
+      .id('lightChip_' + index)
       .onClick(() => this.selectLight(index))
   }
 
@@ -4186,10 +4926,18 @@ struct Index {
       }
 
       if (this.drawerTab === 1) {
+      Row() {
+        this.headerLabel('画幅', 'ASPECT')
+        Blank()
+        Text(this.aspectLabel())
+          .fontSize(9)
+          .fontColor(Theme.secondary)
+      }
+      .width('100%')
+      .margin({ top: 8, bottom: 6 })
+      .alignItems(VerticalAlign.Center)
+
       Flex({ wrap: FlexWrap.Wrap }) {
-        this.hintLabel('画面', 'FRAME',
-          '裁剪比例；胶卷画幅：半幅 3:4、135 3:2、6×6 1:1、6×7 5:4、6×9 3:2',
-          'Crop ratio; film frames: Half 3:4, 135 3:2, 6x6 1:1, 6x7 5:4, 6x9 3:2')
         this.ratioChip('原图', 'FULL', 0, 'full')
         this.ratioChip('1:1', '1:1', 1.0, '1:1')
         this.ratioChip('4:5', '4:5', 0.8, '4:5')
@@ -4200,15 +4948,79 @@ struct Index {
         this.ratioChip('6×6', '6x6', 1.0, '66')
         this.ratioChip('6×7', '6x7', 1.25, '67')
         this.ratioChip('6×9', '6x9', 1.5, '69')
+        if (this.canFreeCrop()) {
+          this.customChip()
+        }
       }
       .width('100%')
-      .margin({ top: 4 })
+
+      if (this.effAspect() > 0.0) {
+      Row() {
+        Text(this.cropEditing
+          ? this.t('拖动画面或 8 个控制点调整裁切', 'Drag the frame or its 8 handles')
+          : this.t('裁切已应用', 'Crop applied'))
+          .fontSize(8.5)
+          .fontColor(Theme.dim)
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(this.t('重置', 'RESET'))
+          .fontSize(9)
+          .fontColor(Theme.secondary)
+          .backgroundColor(Theme.card)
+          .border({ width: 1, color: Theme.rule })
+          .borderRadius(2)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.resetCropBox();
+          })
+        if (this.cropEditing) {
+          Text(this.t('确认裁切', 'APPLY'))
+            .fontSize(9)
+            .fontColor(Theme.accent)
+            .backgroundColor(Theme.cardRaised)
+            .border({ width: 1, color: Theme.accent })
+            .borderRadius(2)
+            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+            .margin({ left: 6 })
+            .onClick(() => {
+              this.confirmCrop();
+            })
+        } else {
+          Text(this.t('调整裁切', 'ADJUST'))
+            .fontSize(9)
+            .fontColor(Theme.secondary)
+            .backgroundColor(Theme.card)
+            .border({ width: 1, color: Theme.rule })
+            .borderRadius(2)
+            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+            .onClick(() => {
+              this.beginCropEdit();
+            })
+        }
+      }
+      .width('100%')
+      .margin({ top: 2 })
+      .alignItems(VerticalAlign.Center)
+      }
 
       Row() {
-        this.hintLabel('校平', 'LEVEL',
-          '校平：±45° 旋转校正地平线，黑角自动裁掉',
-          'Straighten: ±45° rotation to level the horizon; corners are cropped')
-        Slider({ value: this.straighten, min: -45, max: 45, step: 0.2, style: SliderStyle.InSet })
+        this.headerLabel('几何', 'GEOMETRY')
+        Blank()
+        Text(this.t('旋转 · 透视 · 畸变', 'ROTATE · PERSPECTIVE · LENS'))
+          .fontSize(8)
+          .fontColor(Theme.dim)
+      }
+      .width('100%')
+      .margin({ top: 14, bottom: 2 })
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        this.hintLabel('旋转', 'ROTATE',
+          '旋转：任意角度，画面自动铺满并裁掉黑角',
+          'Rotate: any angle; the frame is auto-filled')
+        Slider({ value: this.totalRotate(), min: -180, max: 180, step: 0.1,
+          style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
           .selectedColor(Theme.accent)
           .trackColor(Theme.track)
@@ -4216,15 +5028,78 @@ struct Index {
           .layoutWeight(1)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
-            this.straighten = value;
+            if (this.cropEditing) {
+              this.applyCropFrame();
+            }
+            this.setTotalRotate(value);
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
-              this.cancelQuickRender();
               this.renderPreview();
-            } else {
-              this.requestQuickRender();
             }
           })
-        Text(this.straighten.toFixed(1))
+        Text(this.totalRotate().toFixed(1) + '°')
+          .fontSize(10)
+          .fontColor(Theme.secondary)
+          .width(40)
+          .textAlign(TextAlign.End)
+      }
+      .width('100%')
+      .margin({ top: 2 })
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        this.hintLabel('水平透视', 'H-PERSP',
+          '水平透视：左右方向的梯形校正，±100',
+          'Horizontal perspective: keystone left/right, ±100')
+        Slider({ value: this.perspH, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+          .selectedColor(Theme.accent)
+          .trackColor(Theme.track)
+          .trackThickness(4)
+          .layoutWeight(1)
+          .onChange((value: number, mode: SliderChangeMode) => {
+            this.leaveOriginal();
+            if (this.cropEditing) {
+              this.applyCropFrame();
+            }
+            this.perspH = value;
+            this.previewDuringDrag(mode);
+            if (mode === SliderChangeMode.End) {
+              this.renderPreview();
+            }
+          })
+        Text(Math.round(this.perspH).toString())
+          .fontSize(10)
+          .fontColor(Theme.secondary)
+          .width(30)
+          .textAlign(TextAlign.End)
+      }
+      .width('100%')
+      .margin({ top: 2 })
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        this.hintLabel('垂直透视', 'V-PERSP',
+          '垂直透视：上下方向的梯形校正，±100',
+          'Vertical perspective: keystone up/down, ±100')
+        Slider({ value: this.perspV, min: -100, max: 100, step: 1, style: SliderStyle.InSet })
+        .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+          .selectedColor(Theme.accent)
+          .trackColor(Theme.track)
+          .trackThickness(4)
+          .layoutWeight(1)
+          .onChange((value: number, mode: SliderChangeMode) => {
+            this.leaveOriginal();
+            if (this.cropEditing) {
+              this.applyCropFrame();
+            }
+            this.perspV = value;
+            this.previewDuringDrag(mode);
+            if (mode === SliderChangeMode.End) {
+              this.renderPreview();
+            }
+          })
+        Text(Math.round(this.perspV).toString())
           .fontSize(10)
           .fontColor(Theme.secondary)
           .width(30)
@@ -4247,11 +5122,9 @@ struct Index {
           .onChange((value: number, mode: SliderChangeMode) => {
             this.leaveOriginal();
             this.lensCorrection = value;
+            this.previewDuringDrag(mode);
             if (mode === SliderChangeMode.End) {
-              this.cancelQuickRender();
               this.renderPreview();
-            } else {
-              this.requestQuickRender();
             }
           })
         Text(Math.round(this.lensCorrection).toString())
@@ -4262,28 +5135,6 @@ struct Index {
       }
       .width('100%')
       .margin({ top: 2 })
-      .alignItems(VerticalAlign.Center)
-
-      Row() {
-        this.hintLabel('旋转', 'ROTATE',
-          '旋转：每点一次顺时针转 90°',
-          'Rotate: 90° clockwise per tap')
-        Blank()
-        Text(this.rotation.toString() + '°')
-          .fontSize(9)
-          .fontColor(Theme.secondary)
-          .backgroundColor(Theme.card)
-          .border({ width: 1, color: Theme.rule })
-          .borderRadius(2)
-          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-          .onClick(() => {
-            this.leaveOriginal();
-            this.rotation = (this.rotation + 90) % 360;
-            this.renderPreview();
-          })
-      }
-      .width('100%')
-      .margin({ top: 4 })
       .alignItems(VerticalAlign.Center)
 
       Row() {
@@ -5161,7 +6012,7 @@ struct Index {
           '纯白画布：照片按比例居中，双指捏合可以缩放照片',
           'White canvas: the photo sits centred; pinch to resize it')
         Blank()
-        Text(this.t('白边', 'WHITE'))
+        Text(this.whiteEdge ? this.t('关闭', 'OFF') : this.t('打开', 'ON'))
           .fontSize(10)
           .fontWeight(this.whiteEdge ? FontWeight.Medium : FontWeight.Normal)
           .fontColor(this.whiteEdge ? Theme.accent : Theme.secondary)
@@ -5250,7 +6101,15 @@ struct Index {
       }
 
       if (this.hasPhoto) {
+        // 自动化用例用的模式标记（视觉上不可见）：mode:original / mode:film
+        Text(this.filtersOff ? 'mode:original' : 'mode:film')
+          .id('modeFlag')
+          .fontSize(1)
+          .fontColor(Color.Transparent)
+          .width(1)
+          .height(1)
         Text(this.status)
+          .id('statusLine')
           .fontSize(9)
           .fontColor(Theme.dim)
           .maxLines(1)
@@ -5401,7 +6260,8 @@ struct Index {
             .hitTestBehavior(HitTestMode.None)
         }
       }, (l: LightLayer) => 'ov' + l.id + '-' + l.preset + '-' + l.x + '-' + l.y +
-        '-' + l.scale + '-' + l.rot + '-' + l.strength + '-' + l.flipH + '-' + l.flipV)
+        '-' + l.scale + '-' + l.rot + '-' + l.strength + '-' + l.flipH + '-' + l.flipV +
+        '-' + (l.aspect !== undefined ? l.aspect : 0))
     }
     .width('100%')
     .height('100%')
@@ -5410,35 +6270,85 @@ struct Index {
     .hitTestBehavior(HitTestMode.None)
   }
 
-  /** 画面上的灯位外框：虚线框 + 右上角 ×、右下角旋转键。 */
+  /** 画面上的灯位外框：复用裁切框的描边（白细框 + 四角 L 形直角 + 边中点短条），
+   *  右上角保留 ×、右下角保留旋转键。 */
   @Builder
   lightFrameBox(l: LightLayer) {
     Stack({ alignContent: Alignment.Center }) {
       Column()
         .width(this.lightFrameW(l))
         .height(this.lightFrameH(l))
-        .borderRadius(3)
-        .border({ width: 1, color: Theme.accent, style: BorderStyle.Dashed })
+        .border({ width: 1.5, color: '#FFFFFF' })
+        .hitTestBehavior(HitTestMode.None)
+      // 四个角：边框加粗并向内侧延伸成直角，与裁切框同一套画法。
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: -this.lightFrameW(l) / 2 + 10, y: -this.lightFrameH(l) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: -this.lightFrameW(l) / 2, y: -this.lightFrameH(l) / 2 + 10 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.lightFrameW(l) / 2 - 10, y: -this.lightFrameH(l) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.lightFrameW(l) / 2, y: -this.lightFrameH(l) / 2 + 10 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: -this.lightFrameW(l) / 2 + 10, y: this.lightFrameH(l) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: -this.lightFrameW(l) / 2, y: this.lightFrameH(l) / 2 - 10 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(20).height(3).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.lightFrameW(l) / 2 - 10, y: this.lightFrameH(l) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(3).height(20).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.lightFrameW(l) / 2, y: this.lightFrameH(l) / 2 - 10 })
+        .hitTestBehavior(HitTestMode.None)
+      // 四条边中点短条，与裁切框保持一致。
+      Row()
+        .width(18).height(4).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: 0, y: -this.lightFrameH(l) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(4).height(18).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: this.lightFrameW(l) / 2, y: 0 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(18).height(4).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: 0, y: this.lightFrameH(l) / 2 })
+        .hitTestBehavior(HitTestMode.None)
+      Row()
+        .width(4).height(18).backgroundColor('#FFFFFF').borderRadius(1)
+        .translate({ x: -this.lightFrameW(l) / 2, y: 0 })
         .hitTestBehavior(HitTestMode.None)
       Text('✕')
         .fontSize(10)
-        .fontColor('#121212')
+        .fontColor('#FFFFFF')
         .width(20)
         .height(20)
         .textAlign(TextAlign.Center)
-        .backgroundColor(Theme.accent)
+        .backgroundColor('#99000000')
         .borderRadius(10)
         .translate({ x: this.frameBtnDx(l), y: -this.frameBtnDy(l) })
+        .id('lightDelete_' + l.id)
         .onClick(() => this.deleteLightAt(l.id))
       Text('⟳')
         .fontSize(11)
-        .fontColor('#121212')
+        .fontColor('#FFFFFF')
         .width(20)
         .height(20)
         .textAlign(TextAlign.Center)
-        .backgroundColor(Theme.accent)
+        .backgroundColor('#99000000')
         .borderRadius(10)
-        .responseRegion({ x: -12, y: -12, width: 44, height: 44 })
         .translate({ x: this.frameBtnDx(l), y: this.frameBtnDy(l) })
         .onClick(() => this.rotateLightAt(l.id))
         .gesture(
@@ -5451,6 +6361,7 @@ struct Index {
             .onActionCancel(() => this.endRotateDrag())
         )
     }
+    .id('lightFrame_' + l.id)
     .translate({
       x: l.x / 100.0 * this.lightAreaW(),
       y: l.y / 100.0 * this.lightAreaH()
@@ -5466,7 +6377,7 @@ struct Index {
       ForEach(this.frameLights(), (l: LightLayer) => {
         this.lightFrameBox(l)
       }, (l: LightLayer) => 'lf' + l.id + '-' + l.rot + '-' + l.strength + '-' +
-        l.scale + '-' + l.x + '-' + l.y)
+        l.scale + '-' + l.x + '-' + l.y + '-' + (l.aspect !== undefined ? l.aspect : 0))
     }
     .width('100%')
     .height('100%')
@@ -5515,7 +6426,7 @@ struct Index {
             .objectFit(ImageFit.Contain)
             .width('100%')
             .height('100%')
-            .scale({ x: this.zoomK, y: this.zoomK })
+            .scale({ x: this.zoomK * this.cropViewScale(), y: this.zoomK * this.cropViewScale() })
             .translate({ x: this.panX + this.cropDx, y: this.panY + this.cropDy })
             .onMouse((e: MouseEvent) => {
               this.hoverX = e.x;
@@ -5526,6 +6437,17 @@ struct Index {
                 PinchGesture({ fingers: 2 })
                   .onActionStart((e: GestureEvent) => {
                     this.baseZoom = this.zoomK;
+                    // 记录双指初始中心与当前平移：缩放围绕手指、双指滑动直接平移画面。
+                    this.pinchBasePanX = this.panX;
+                    this.pinchBasePanY = this.panY;
+                    this.pinchCenterX = this.pinchFocus(e, 0);
+                    this.pinchCenterY = this.pinchFocus(e, 1);
+                    // 裁切编辑时画面必须与裁切框保持同一坐标系，屏蔽缩放/平移。
+                    if (this.cropEditing) {
+                      this.pinchLightOn = false;
+                      this.pinchWhiteOn = false;
+                      return;
+                    }
                     // 画面上有灯时优先缩放灯光：双指捏合改「大小」，和滑杆同一参数。
                     this.pinchLightOn = this.zoomK <= 1.0 && this.effAspect() <= 0.0 &&
                       ((this.lightIndex > 0 && this.lightDraft) || this.lightLayers.length > 0);
@@ -5556,13 +6478,15 @@ struct Index {
                       let best: number = Number.MAX_VALUE;
                       let found: boolean = false;
                       if (this.lightIndex > 0 && this.lightDraft &&
-                        this.insideLight(tx, ty, this.lightX, this.lightY, this.lightScale, aw, ah)) {
+                        this.insideLight(tx, ty, this.lightX, this.lightY, this.lightScale, aw, ah,
+                          this.lightAspectFree)) {
                         best = this.lightDist2(tx, ty, this.lightX, this.lightY, iw, ih);
                         found = true;
                       }
                       for (let i: number = 0; i < this.lightLayers.length; i++) {
                         const l: LightLayer = this.lightLayers[i];
-                        if (!this.insideLight(tx, ty, l.x, l.y, l.scale, aw, ah)) {
+                        if (!this.insideLight(tx, ty, l.x, l.y, l.scale, aw, ah,
+                          this.lightFrameAspect(l))) {
                           continue;
                         }
                         const d: number = this.lightDist2(tx, ty, l.x, l.y, iw, ih);
@@ -5586,6 +6510,9 @@ struct Index {
                     }
                   })
                   .onActionUpdate((e: GestureEvent) => {
+                    if (this.cropEditing) {
+                      return;
+                    }
                     if (this.pinchLightOn) {
                       const sc: number = Math.round(Math.max(10, Math.min(250,
                         this.pinchBaseScale * e.scale)));
@@ -5600,8 +6527,16 @@ struct Index {
                       this.whiteScale = Math.max(0.4, Math.min(1.0, ns));
                       this.requestQuickRender();
                     } else {
-                      this.zoomK = Math.max(1.0, Math.min(8.0, this.baseZoom * e.scale));
-                      if (this.zoomK <= 1.0) {
+                      const z0: number = this.baseZoom > 0.01 ? this.baseZoom : 1.0;
+                      const z1: number = Math.max(1.0, Math.min(8.0, z0 * e.scale));
+                      const fx: number = this.pinchFocus(e, 0);
+                      const fy: number = this.pinchFocus(e, 1);
+                      const r: number = z1 / z0;
+                      // 双指中心移动量直接变成平移；缩放也围绕双指中心，画面不会往中间跳。
+                      this.panX = fx - (this.pinchCenterX - this.pinchBasePanX) * r;
+                      this.panY = fy - (this.pinchCenterY - this.pinchBasePanY) * r;
+                      this.zoomK = z1;
+                      if (z1 <= 1.0) {
                         // 捏合缩回 100% 时同步清掉平移残留，否则图片会卡在偏移位置。
                         this.panX = 0;
                         this.panY = 0;
@@ -5627,6 +6562,9 @@ struct Index {
                   }),
                 PanGesture({ fingers: 1 })
                   .onActionStart((e: GestureEvent) => {
+                    this.canvasDragged = false;
+                    this.lightResizeOn = false;
+                    this.lightResizePending = false;
                     // 2in1 上滚轮也会触发这条 PanGesture：只做缩放，不能进入拖画幅/拖灯。
                     this.wheelOn = this.isWheel(e);
                     if (this.wheelOn) {
@@ -5637,9 +6575,24 @@ struct Index {
                     this.basePanY = this.panY;
                     this.cropBaseX = this.cropX;
                     this.cropBaseY = this.cropY;
+                    this.cropFrameBaseX = this.cropFrameDx;
+                    this.cropFrameBaseY = this.cropFrameDy;
+                    if (this.cropEditing) {
+                      this.cropHandle = this.cropHandleAt(e);
+                      this.cropScaling = this.cropHandle >= 0 && this.cropHandle < 8;
+                    } else {
+                      this.cropHandle = -1;
+                      this.cropScaling = false;
+                      // 先看有没有抓到灯框控制点：抓到就只改宽高，绝不进入拖灯。
+                      this.beginLightResize(e);
+                      if (!this.lightResizeOn && e.fingerList.length < 1) {
+                        this.lightResizePending = true;
+                      }
+                    }
                     // 双指捏合时不进入单指拖灯：捏合期间只看 PinchGesture，否则灯光会跟着
                     // 其中一根手指跑、外框还会闪。
-                    this.lightDragOn = this.zoomK <= 1.0 && this.effAspect() <= 0.0 &&
+                    this.lightDragOn = !this.lightResizeOn && this.zoomK <= 1.0 &&
+                      this.effAspect() <= 0.0 &&
                       e.fingerList.length < 2 &&
                       ((this.lightIndex > 0 && this.lightDraft) || this.lightLayers.length > 0);
                     const s0: number = this.previewScale();
@@ -5655,6 +6608,7 @@ struct Index {
                     let rot: number = this.lightRot;
                     let fh: boolean = this.lightFlipH;
                     let fv: boolean = this.lightFlipV;
+                    let aspect: number = this.lightAspectFree;
                     this.lightDragType = 0;
                     this.lightDragLayerId = -1;
                     if (this.lightDragOn) {
@@ -5678,6 +6632,7 @@ struct Index {
                           rot = l.rot;
                           fh = l.flipH;
                           fv = l.flipV;
+                          aspect = l.aspect !== undefined ? l.aspect : 0;
                           this.lightDragType = 1;
                           this.lightDragLayerId = l.id;
                         }
@@ -5694,7 +6649,8 @@ struct Index {
                       const dw: number = iw * Math.max(0.01, scale / 100.0);
                       this.lightDrag.src = 'light/' + preset.id + '.webp';
                       this.lightDrag.w = dw;
-                      this.lightDrag.h = dw / (this.lightAspect > 0 ? this.lightAspect : 1.0);
+                      this.lightDrag.h = dw / (aspect > 0 ? aspect :
+                        (this.lightAspect > 0 ? this.lightAspect : 1.0));
                       this.lightDrag.alpha = 1.0;
                       this.lightDrag.gain = preset.gain * Math.min(1.0, strength / 100.0);
                       this.lightDrag.rot = rot;
@@ -5707,17 +6663,43 @@ struct Index {
                       this.wheelZoom(e.axisVertical !== undefined ? e.axisVertical : 0);
                       return;
                     }
+                    if (this.lightResizePending) {
+                      this.lightResizePending = false;
+                      this.beginLightResize(e);
+                    }
+                    if (this.lightResizeOn) {
+                      this.canvasDragged = true;
+                      if (e.fingerList.length > 0) {
+                        this.resizeLightFromHandle(e.fingerList[0].localX - this.viewW / 2.0,
+                          e.fingerList[0].localY - this.viewH / 2.0);
+                      }
+                      return;
+                    }
                     if (this.zoomK > 1.0) {
+                      this.canvasDragged = true;
                       this.panX = this.basePanX + e.offsetX;
                       this.panY = this.basePanY + e.offsetY;
-                    } else if (this.effAspect() > 0.0) {
-                      // 画幅裁剪时，单指拖动就是移动取景框：图片跟手走。
-                      const sh: number[] = this.cropShiftPx();
-                      const s: number = this.previewScale();
-                      const maxX: number = sh[0] * 2.0 * s;
-                      const maxY: number = sh[1] * 2.0 * s;
-                      this.cropDx = Math.max(-maxX, Math.min(maxX, e.offsetX));
-                      this.cropDy = Math.max(-maxY, Math.min(maxY, e.offsetY));
+                    } else if (this.cropEditing && this.effAspect() > 0.0) {
+                      // 裁切编辑：8 个控制点改框大小，框内拖动整体平移，都不跑像素渲染。
+                      if (this.cropHandle < 0) {
+                        // 部分输入源在 onActionStart 里拿不到 fingerList，这里补一次命中判定。
+                        this.cropHandle = this.cropHandleAt(e);
+                      }
+                      if (this.cropHandle >= 0 && this.cropHandle < 8 &&
+                        e.fingerList.length > 0) {
+                        this.resizeCropFromHandle(this.cropHandle,
+                          e.fingerList[0].localX - this.viewW / 2,
+                          e.fingerList[0].localY - this.viewH / 2);
+                      } else {
+                        const g: number[] = this.cropGeomMax();
+                        const maxX: number = Math.max(0, (g[2] - this.cropFrameW) / 2);
+                        const maxY: number = Math.max(0, (g[3] - this.cropFrameH) / 2);
+                        this.cropFrameDx = Math.max(-maxX,
+                          Math.min(maxX, this.cropFrameBaseX + e.offsetX));
+                        this.cropFrameDy = Math.max(-maxY,
+                          Math.min(maxY, this.cropFrameBaseY + e.offsetY));
+                      }
+                      this.canvasDragged = true;
                     } else if (this.lightDragOn && !this.pinchLightOn) {
                       // 选中灯光（或直接抓住已存图层）后，在画面上拖动光源：跟手比 1:1。
                       const s: number = this.previewScale();
@@ -5736,21 +6718,20 @@ struct Index {
                       this.wheelOn = false;
                       return;
                     }
-                    if (this.zoomK <= 1.0 && this.effAspect() > 0.0 &&
-                      (this.cropDx !== 0 || this.cropDy !== 0)) {
-                      const sh: number[] = this.cropShiftPx();
-                      const s: number = this.previewScale();
-                      if (sh[0] > 0.5 && s > 0) {
-                        this.cropX = Math.max(0.0, Math.min(1.0,
-                          this.cropBaseX - (this.cropDx / s) / (2.0 * sh[0])));
+                    if (this.lightResizeOn) {
+                      // 灯框控制点松手：只有真的拖动过才重渲染，避免点 ✕ 时白跑一次。
+                      this.lightResizeOn = false;
+                      this.lightResizePending = false;
+                      this.lightDragOn = false;
+                      if (this.lightResizeDirty) {
+                        this.lightResizeDirty = false;
+                        this.afterLightEdit();
                       }
-                      if (sh[1] > 0.5 && s > 0) {
-                        this.cropY = Math.max(0.0, Math.min(1.0,
-                          this.cropBaseY - (this.cropDy / s) / (2.0 * sh[1])));
-                      }
-                      this.cropDx = 0;
-                      this.cropDy = 0;
-                      this.renderPreview();
+                    } else if (this.cropEditing) {
+                      // 松手不改参数、不重渲染：等用户点「确认裁切」。
+                      this.cropHandle = -1;
+                      this.cropScaling = false;
+                      this.lightDragOn = false;
                     } else if (this.zoomK <= 1.0 && this.lightDragOn &&
                       (this.lightPendingX !== this.lightBaseX ||
                         this.lightPendingY !== this.lightBaseY)) {
@@ -5759,7 +6740,8 @@ struct Index {
                         this.lightLayers = this.lightLayers.map((l: LightLayer) => l.id === id
                           ? { id: l.id, preset: l.preset, strength: l.strength, scale: l.scale,
                             x: this.lightPendingX, y: this.lightPendingY,
-                            rot: l.rot, flipH: l.flipH, flipV: l.flipV } as LightLayer
+                            rot: l.rot, flipH: l.flipH, flipV: l.flipV,
+                            aspect: l.aspect } as LightLayer
                           : l);
                       } else {
                         this.lightDraft = true;
@@ -5778,10 +6760,17 @@ struct Index {
                     this.wheelOn = false;
                     this.cropDx = 0;
                     this.cropDy = 0;
+                    this.lightResizeOn = false;
+                    this.lightResizePending = false;
                     this.lightDragOn = false;
                   }),
                 TapGesture({ count: 1 })
                   .onAction(() => {
+                    // 拖动抬手时系统可能仍判成单击：本次有拖动就不复位，避免刚平移完又弹回。
+                    if (this.canvasDragged) {
+                      this.canvasDragged = false;
+                      return;
+                    }
                     // 面板展开时单击画布复位缩放：放大或平移后点一下图片回到 100% 居中。
                     if (this.zoomK > 1.0 || this.panX !== 0 || this.panY !== 0 ||
                       this.cropDx !== 0 || this.cropDy !== 0) {
@@ -5813,9 +6802,12 @@ struct Index {
           }
           // 每盏灯在所有编辑页签都画出可删除/可旋转的外框；放在直方图之后，
           // 避免灯位落在右上角时 ✕ / ⟳ 被直方图面板盖住。
-          if (!this.filtersOff && !this.showOriginal && !this.lightDragOn &&
+          if (!this.showOriginal && !this.lightDragOn &&
             this.allLights().length > 0) {
             this.lightFrames()
+          }
+          if (this.cropEditing) {
+            this.cropOverlay()
           }
           this.canvasOverlay()
         }

@@ -472,18 +472,11 @@ struct CameraPage {
       if (result.photoUris.length === 0) {
         return;
       }
-      const f: FilmSummary | undefined = this.currentFilm();
-      let paperId: string = '';
-      if (f !== undefined) {
-        const fa: FilmAssets | undefined = this.filmCache.get(f.id);
-        if (fa !== undefined) {
-          paperId = fa.type === 'positive' ? 'scan_' + fa.id : fa.targetPrint;
-        }
-      }
+      // 相册导入不带胶卷/相纸：进编辑页先看原图，由用户自己挑，避免"默认套滤镜"。
       const params: CameraParams = {
         uri: result.photoUris[0],
-        film: f !== undefined ? f.id : '',
-        paper: paperId
+        film: '',
+        paper: ''
       };
       await router.pushUrl({ url: 'pages/Index', params: params });
     } catch (e) {
@@ -495,7 +488,7 @@ struct CameraPage {
   topBar() {
     Row() {
       Column({ space: 1 }) {
-        Text('DigitalFilm').fontSize(13).letterSpacing(2.4).fontColor(Theme.text)
+        Text('DigitalFilm').fontSize(13).letterSpacing(1.1).fontWeight(FontWeight.Medium).fontColor(Theme.text)
         Text(this.t('胶片相机', 'FILM CAMERA')).fontSize(7).letterSpacing(1.6).fontColor(Theme.dim)
       }
       .alignItems(HorizontalAlign.Start)
@@ -607,6 +600,7 @@ struct CameraPage {
         }
         Text(this.t('相册', 'GALLERY')).fontSize(7).letterSpacing(1.0).fontColor(Theme.secondary)
       }
+      .id('galleryBtn')
       .onClick(() => {
         this.openGallery();
       })

@@ -1246,12 +1246,14 @@ export function applyLightLayer(pixels: Uint8Array, w: number, h: number,
                                 opacity: number, scale: number,
                                 offX: number, offY: number, gain: number = 1.0,
                                 rot: number = 0.0, flipH: boolean = false,
-                                flipV: boolean = false): void {
+                                flipV: boolean = false, aspect: number = 0.0): void {
   if (opacity <= 0.0 || tw <= 0 || th <= 0 || w <= 0 || h <= 0) {
     return;
   }
   const dw: number = Math.max(1.0, w * scale);
-  const dh: number = Math.max(1.0, dw * th / tw);
+  // aspect>0 表示灯框被拖成了自由比例：贴图拉伸到该比例，保证预览与导出同一形状。
+  const dh: number = aspect > 0.0 ? Math.max(1.0, dw / aspect)
+    : Math.max(1.0, dw * th / tw);
   const cx: number = w / 2.0 + offX * w;
   const cy: number = h / 2.0 + offY * h;
   const rad: number = rot * Math.PI / 180.0;

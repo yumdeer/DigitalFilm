@@ -62,6 +62,8 @@ export interface PostLight {
   rot: number;
   flipH: boolean;
   flipV: boolean;
+  /** 灯框宽高比（宽/高）；0 = 贴图原始比例（自由修改模式拖出的比例）。 */
+  aspect?: number;
 }
 
 export interface PostResult {
@@ -109,7 +111,8 @@ export function postTask(p: PostPayload): PostResult {
     const L: PostLight = p.lights[i];
     if (L.w > 0 && L.h > 0 && L.opacity > 0) {
       applyLightLayer(px, p.w, p.h, L.tex, L.w, L.h, L.opacity, L.scale,
-        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV);
+        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV,
+        L.aspect !== undefined ? L.aspect : 0);
     }
   }
   const t4: number = Date.now();
@@ -193,6 +196,22 @@ export function gradeTask(p: PostPayload): GradeResult {
   };
 }
 
+/** 只叠灯光：原图直通导出时用，避免把整条调色/片边链跑一遍。 */
+@Concurrent
+export function lightTask(p: PostPayload): PostResult {
+  const px: Uint8Array = p.pixels;
+  const t0: number = Date.now();
+  for (let i = 0; i < p.lights.length; i++) {
+    const L: PostLight = p.lights[i];
+    if (L.w > 0 && L.h > 0 && L.opacity > 0) {
+      applyLightLayer(px, p.w, p.h, L.tex, L.w, L.h, L.opacity, L.scale,
+        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV,
+        L.aspect !== undefined ? L.aspect : 0);
+    }
+  }
+  return { pixels: px, w: p.w, h: p.h, stageMs: 'light-only ' + (Date.now() - t0) + 'ms' };
+}
+
 /** 只跑灯光 + 片边 + 日期；调色结果由调用方传入（通常是缓存）。 */
 @Concurrent
 export function finishTask(p: PostPayload): PostResult {
@@ -202,7 +221,8 @@ export function finishTask(p: PostPayload): PostResult {
     const L: PostLight = p.lights[i];
     if (L.w > 0 && L.h > 0 && L.opacity > 0) {
       applyLightLayer(px, p.w, p.h, L.tex, L.w, L.h, L.opacity, L.scale,
-        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV);
+        L.offX, L.offY, L.gain, L.rot, L.flipH, L.flipV,
+        L.aspect !== undefined ? L.aspect : 0);
     }
   }
   const t1: number = Date.now();

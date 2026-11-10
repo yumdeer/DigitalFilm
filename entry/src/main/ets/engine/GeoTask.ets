@@ -4,7 +4,7 @@
  * plain implementations they call.
  */
 
-import { rotate90, flip, correctLens, straighten, resizeBox, GeoResult } from './Geometry';
+import { rotate90, flip, correctLens, straighten, perspective, resizeBox, GeoResult } from './Geometry';
 
 export interface GeometryPayload {
   src: Uint8Array;
@@ -15,10 +15,15 @@ export interface GeometryPayload {
   flipV: boolean;
   lens: number;
   straightenDeg: number;
+  /** 水平/垂直透视，-100..100。 */
+  perspH: number;
+  perspV: number;
   aspect: number;
   /** Normalised crop centre: 0 = top/left, 0.5 = centred, 1 = bottom/right. */
   cropX: number;
   cropY: number;
+  /** Crop frame size as a fraction of the largest fitting rect (1 = max). */
+  cropZoom: number;
   maxEdge: number;
 }
 
@@ -39,6 +44,9 @@ export function geometryTask(p: GeometryPayload): GeoResult {
   if (p.straightenDeg > 0.05 || p.straightenDeg < -0.05) {
     g = straighten(g.src, g.w, g.h, p.straightenDeg);
   }
+  if (p.perspH > 0.5 || p.perspH < -0.5 || p.perspV > 0.5 || p.perspV < -0.5) {
+    g = perspective(g.src, g.w, g.h, p.perspH, p.perspV);
+  }
   if (p.aspect > 0.0) {
     const w: number = g.w;
     const h: number = g.h;
@@ -49,6 +57,9 @@ export function geometryTask(p: GeometryPayload): GeoResult {
     } else {
       ch = Math.round(w / p.aspect);
     }
+    const zoom: number = p.cropZoom > 0.0 ? Math.max(0.05, Math.min(1.0, p.cropZoom)) : 1.0;
+    cw = Math.round(cw * zoom);
+    ch = Math.round(ch * zoom);
     cw = Math.max(2, cw - (cw % 2));
     ch = Math.max(2, ch - (ch % 2));
     const x0: number = Math.max(0, Math.min(w - cw,

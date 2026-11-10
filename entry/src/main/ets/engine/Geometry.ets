@@ -231,3 +231,60 @@ export function correctLens(src: Uint8Array, w: number, h: number, amount: numbe
   }
   return { src: out, w: w, h: h };
 }
+
+/**
+ * Keystone correction. `hor` / `ver` are the UI values (-100..100). The
+ * destination frame samples a trapezoid inside the source, so the warp never
+ * leaves blank borders; the crop step trims whatever remains. Both axes share
+ * one bilinear pass, which keeps a 2000 px preview well inside the task budget.
+ */
+export function perspective(src: Uint8Array, w: number, h: number,
+                            hor: number, ver: number): GeoResult {
+  const kh: number = Math.max(-0.5, Math.min(0.5, hor / 200.0));
+  const kv: number = Math.max(-0.5, Math.min(0.5, ver / 200.0));
+  if ((kh > -0.002 && kh < 0.002) && (kv > -0.002 && kv < 0.002)) {
+    return { src: src, w: w, h: h };
+  }
+  const out: Uint8Array = new Uint8Array(w * h * 4);
+  const maxX: number = w - 1;
+  const maxY: number = h - 1;
+  for (let y = 0; y < h; y++) {
+    const v: number = (y + 0.5) / h * 2.0 - 1.0;
+    // 垂直透视：顶部或底部按比例收窄，形成梯形映射。
+    const fv: number = 1.0 - Math.abs(kv) *
+      (kv > 0.0 ? (1.0 - v) * 0.5 : (1.0 + v) * 0.5);
+    for (let x = 0; x < w; x++) {
+      const u: number = (x + 0.5) / w * 2.0 - 1.0;
+      const fh: number = 1.0 - Math.abs(kh) *
+        (kh > 0.0 ? (1.0 - u) * 0.5 : (1.0 + u) * 0.5);
+      const su: number = Math.max(-1.0, Math.min(1.0, u * fv));
+      const sv: number = Math.max(-1.0, Math.min(1.0, v * fh));
+      const sx: number = (su + 1.0) * 0.5 * maxX;
+      const sy: number = (sv + 1.0) * 0.5 * maxY;
+      const x0: number = Math.floor(sx);
+      const y0: number = Math.floor(sy);
+      const fx: number = sx - x0;
+      const fy: number = sy - y0;
+      const xa: number = x0 < 0 ? 0 : (x0 > maxX ? maxX : x0);
+      const ya: number = y0 < 0 ? 0 : (y0 > maxY ? maxY : y0);
+      const x1: number = xa + 1 < w ? xa + 1 : maxX;
+      const y1: number = ya + 1 < h ? ya + 1 : maxY;
+      const o00: number = (ya * w + xa) * 4;
+      const o10: number = (ya * w + x1) * 4;
+      const o01: number = (y1 * w + xa) * 4;
+      const o11: number = (y1 * w + x1) * 4;
+      const w00: number = (1.0 - fx) * (1.0 - fy);
+      const w10: number = fx * (1.0 - fy);
+      const w01: number = (1.0 - fx) * fy;
+      const w11: number = fx * fy;
+      const d: number = (y * w + x) * 4;
+      out[d] = Math.round(w00 * src[o00] + w10 * src[o10] + w01 * src[o01] + w11 * src[o11]);
+      out[d + 1] = Math.round(w00 * src[o00 + 1] + w10 * src[o10 + 1] +
+        w01 * src[o01 + 1] + w11 * src[o11 + 1]);
+      out[d + 2] = Math.round(w00 * src[o00 + 2] + w10 * src[o10 + 2] +
+        w01 * src[o01 + 2] + w11 * src[o11 + 2]);
+      out[d + 3] = 255;
+    }
+  }
+  return { src: out, w: w, h: h };
+}
