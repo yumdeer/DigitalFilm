@@ -54,8 +54,9 @@ export function rotate90(src: Uint8Array, w: number, h: number, times: number): 
 }
 
 /**
- * Rotate by `deg` degrees and keep the largest axis-aligned rectangle that
- * stays inside the rotated frame, so no black corners reach the print.
+ * Rotate by `deg` degrees and keep the whole rotated frame (its bounding box).
+ * The corners outside the source are left black; cropping is the user's call
+ * in the crop panel, so a plain rotate must never silently cut the picture.
  */
 export function straighten(src: Uint8Array, w: number, h: number, deg: number): GeoResult {
   const absDeg: number = Math.abs(deg);
@@ -65,17 +66,10 @@ export function straighten(src: Uint8Array, w: number, h: number, deg: number): 
   const a: number = absDeg * Math.PI / 180.0;
   const cosA: number = Math.cos(a);
   const sinA: number = Math.sin(a);
-  const den: number = cosA * cosA - sinA * sinA;
-  let nw: number = 0;
-  let nh: number = 0;
-  if (den > 1e-6) {
-    nw = (w * cosA - h * sinA) / den;
-    nh = (h * cosA - w * sinA) / den;
-  }
-  if (nw < 16 || nh < 16) {
-    nw = w * cosA - h * sinA;
-    nh = h * cosA - w * sinA;
-  }
+  // 只做旋转，不做「内切矩形」自动裁切：输出整幅旋转图的外接矩形，
+  // 四角留黑，避免用户只是转一下画面就被裁掉一圈。
+  let nw: number = w * cosA + h * sinA;
+  let nh: number = w * sinA + h * cosA;
   nw = Math.max(4, Math.floor(nw / 2.0) * 2);
   nh = Math.max(4, Math.floor(nh / 2.0) * 2);
 
@@ -96,6 +90,12 @@ export function straighten(src: Uint8Array, w: number, h: number, deg: number): 
       const dx: number = x - ox;
       const sx: number = dx * ct + dy * st + cx0;
       const sy: number = -dx * st + dy * ct + cy0;
+      const d: number = (y * nw + x) * 4;
+      // 外接矩形模式下四角落在原图之外，直接留黑，避免边缘像素被拉伸成长条。
+      if (sx < 0 || sy < 0 || sx > maxX || sy > maxY) {
+        out[d + 3] = 255;
+        continue;
+      }
       const x0: number = Math.floor(sx);
       const y0: number = Math.floor(sy);
       const fx: number = sx - x0;
@@ -112,7 +112,6 @@ export function straighten(src: Uint8Array, w: number, h: number, deg: number): 
       const w10: number = fx * (1.0 - fy);
       const w01: number = (1.0 - fx) * fy;
       const w11: number = fx * fy;
-      const d: number = (y * nw + x) * 4;
       out[d] = Math.round(w00 * src[o00] + w10 * src[o10] + w01 * src[o01] + w11 * src[o11]);
       out[d + 1] = Math.round(w00 * src[o00 + 1] + w10 * src[o10 + 1] + w01 * src[o01 + 1] + w11 * src[o11 + 1]);
       out[d + 2] = Math.round(w00 * src[o00 + 2] + w10 * src[o10 + 2] + w01 * src[o01 + 2] + w11 * src[o11 + 2]);

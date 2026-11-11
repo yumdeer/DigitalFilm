@@ -1026,14 +1026,22 @@ struct Index {
     return out;
   }
 
+  /**
+   * 灯光坐标所在图像区域的显示尺寸。必须用几何处理后的输出尺寸（旋转/裁切之后），
+   * 否则转一下画面，外框和光斑就会错位、抓框变成拉控制点。
+   */
   private lightAreaW(): number {
     const s: number = this.previewScale();
-    return (this.innerW > 0 ? this.innerW : this.previewW) * s;
+    const w: number = this.outW > 0 ? this.outW
+      : (this.innerW > 0 ? this.innerW : this.previewW);
+    return w * s;
   }
 
   private lightAreaH(): number {
     const s: number = this.previewScale();
-    return (this.innerH > 0 ? this.innerH : this.previewH) * s;
+    const h: number = this.outH > 0 ? this.outH
+      : (this.innerH > 0 ? this.innerH : this.previewH);
+    return h * s;
   }
 
   /** 灯光外框宽度（显示像素）：和拖动预览用同一套换算。 */
@@ -5029,8 +5037,8 @@ struct Index {
 
       Row() {
         this.hintLabel('旋转', 'ROTATE',
-          '旋转：任意角度，画面自动铺满并裁掉黑角',
-          'Rotate: any angle; the frame is auto-filled')
+          '旋转：任意角度，整幅画面完整旋转，不做裁切',
+          'Rotate: any angle, the whole frame is kept')
         Slider({ value: this.totalRotate(), min: -180, max: 180, step: 0.1,
           style: SliderStyle.InSet })
         .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
@@ -6469,9 +6477,8 @@ struct Index {
                     // 白边模式下不再缩放灯光，双指直接调照片在白底上的大小。
                     this.pinchWhiteOn = false;
                     if (this.pinchLightOn) {
-                      const s0: number = this.previewScale();
-                      const iw: number = (this.innerW > 0 ? this.innerW : this.previewW) * s0;
-                      const ih: number = (this.innerH > 0 ? this.innerH : this.previewH) * s0;
+                      const iw: number = this.lightAreaW();
+                      const ih: number = this.lightAreaH();
                       let mx: number = this.viewW / 2;
                       let my: number = this.viewH / 2;
                       if (e.fingerList.length > 0) {
@@ -6607,9 +6614,8 @@ struct Index {
                       this.effAspect() <= 0.0 &&
                       e.fingerList.length < 2 &&
                       ((this.lightIndex > 0 && this.lightDraft) || this.lightLayers.length > 0);
-                    const s0: number = this.previewScale();
-                    const iw: number = (this.innerW > 0 ? this.innerW : this.previewW) * s0;
-                    const ih: number = (this.innerH > 0 ? this.innerH : this.previewH) * s0;
+                    const iw: number = this.lightAreaW();
+                    const ih: number = this.lightAreaH();
                     // 按手指落点挑最近的一盏灯：面板这盏和已存图层都能直接拖，
                     // 不会出现「叠了两盏只有一盏跟着动」。
                     let baseX: number = this.lightX;
@@ -6714,9 +6720,8 @@ struct Index {
                       this.canvasDragged = true;
                     } else if (this.lightDragOn && !this.pinchLightOn) {
                       // 选中灯光（或直接抓住已存图层）后，在画面上拖动光源：跟手比 1:1。
-                      const s: number = this.previewScale();
-                      const dw: number = (this.innerW > 0 ? this.innerW : this.previewW) * s;
-                      const dh: number = (this.innerH > 0 ? this.innerH : this.previewH) * s;
+                      const dw: number = this.lightAreaW();
+                      const dh: number = this.lightAreaH();
                       this.lightPendingX = Math.max(-50, Math.min(50,
                         this.lightBaseX + e.offsetX / Math.max(1, dw) * 100));
                       this.lightPendingY = Math.max(-50, Math.min(50,
